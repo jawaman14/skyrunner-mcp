@@ -18,4 +18,5 @@ jobs:
       - run: python tests/test_guards.py src/skyrunner_mcp/server.py
       - run: python tests/test_runtime.py
       - run: python tests/test_collaboration.py
+      - run: python tests/test_github_collab.py
       - run: python -m build
