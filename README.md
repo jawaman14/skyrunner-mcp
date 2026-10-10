@@ -36,8 +36,10 @@ dispatch without authentication. GitHub tools operate on the **game checkout's o
   `skyrunner_collaboration_` prefix). Start with `start`, verify target/revision and read the shared inbox.
 - Game: filtered tests, import, smoke, screenshots, balance, scripts, command/switch introspection and
   project-status checks. Long jobs return IDs; poll their owning client instead of restarting them.
-- Jobs: status/logs/cancellation. Kernel locks serialize Godot work per checkout across MCP processes;
-  each worktree has a separate cache. Independent worktrees still compete for host memory.
+- Jobs: status/logs/cancellation. Kernel locks serialize Godot work per checkout across MCP processes, and a
+  machine-wide lock runs one Godot job at a time across every checkout and worktree, because two can exhaust
+  the memory (`SKYRUNNER_MACHINE_LOCK`: another absolute lock path, or `off`). Shell runs take the same lock
+  through `skyrunner-godot-lock [--wait] -- bash tools/test.sh <filter>`.
 - GitHub: PR/issue inspection, CI/logs, authorized PR/issue updates and conservative merge/cleanup tools.
   Tool availability is not permission to publish, merge or send messages.
 
@@ -50,7 +52,10 @@ The test worker and collaboration guide ship inside the package, including wheel
 Read [COLLABORATION.md](src/skyrunner_mcp/COLLABORATION.md). Claims coordinate explicit paths, use unique
 agent-session owners, renew before expiry and release at handoff. Claims are advisory: they do not
 intercept shell/editor writes. Notes persist under the game's Git common directory, do not travel to
-unrelated clones and do not wake the other agent. Both agents must read their inbox during work.
+unrelated clones and do not wake the other agent. Both agents must read their inbox during work. To share
+one board between separate clones on one machine, set `SKYRUNNER_BOARD` to the same absolute `.sqlite3`
+path in every client's environment (for example, an existing clone's
+`.git/skyrunner-mcp/collaboration.sqlite3`).
 
 ## Development and tests
 
