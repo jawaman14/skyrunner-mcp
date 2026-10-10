@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skyrunner-mcp"
+version = "0.1.0"
+description = "Standalone MCP server for Skyrunner and simultaneous Claude/Codex collaboration"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = ["mcp>=2.3,<3", "httpx>=0.27"]
+
+[project.scripts]
+skyrunner-mcp = "skyrunner_mcp.server:main"
+
+[project.urls]
+Repository = "https://github.com/jawaman14/skyrunner-mcp"
+Game = "https://github.com/jawaman14/skyrunner"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+skyrunner_mcp = ["*.md", "*.gd"]
