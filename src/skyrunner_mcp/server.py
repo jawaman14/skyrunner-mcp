@@ -1030,6 +1030,287 @@ async def github_pr_merge(
     return f"Merged #{number} ({method}) as {r.get('sha', '?')[:8]}; CI was green on {expected_head_sha[:8]} ({len(jobs)} jobs)."
 
 
+# ----------------------------------------------------------------------------------------------- collaboration on GitHub
+# Both agents use the owner's GitHub account, and GitHub won't let an account approve its own pull request, so a
+# review's verdict travels in a marker in the review body; the branch prefix (claude/..., codex/...) says who wrote it.
+_REVIEW_RE = re.compile(r"<!-- skyrunner-review agent=(claude|codex) verdict=(approve|changes|comment) head=([0-9a-f]{40}) -->")
+_POLL_SECONDS = 20.0  # github_pr_wait's interval between looks at GitHub (tests shorten it)
+_STALE_BEHIND = 20  # commits behind the default branch after which a PR syncs before it merges (AGENTS.md)
+
+
+def _agent_of(name: str) -> str:
+    """'claude' or 'codex' from a session owner or branch name (claude-1234, codex/startup-tests); '' otherwise."""
+    m = re.match(r"(claude|codex)(?![a-z])", name.strip().lower())
+    return m.group(1) if m else ""
+
+
+def _review_marker(agent: str, verdict: str, head: str) -> str:
+    return f"<!-- skyrunner-review agent={agent} verdict={verdict} head={head} -->"
+
+
+def _marked_reviews(reviews: list) -> list[dict]:
+    """The agent reviews among a PR's reviews, oldest first: agent, verdict, head and when."""
+    out = []
+    for r in reviews:
+        m = _REVIEW_RE.search(r.get("body") or "")
+        if m:
+            out.append({"agent": m.group(1), "verdict": m.group(2), "head": m.group(3), "at": r.get("submitted_at") or ""})
+    return sorted(out, key=lambda r: r["at"])
+
+
+async def _waiting_comments(number: int) -> list:
+    """Top-level inline review comments nobody has replied to (what github_pr_merge refuses on)."""
+    comments = await gh().paged(f"pulls/{number}/comments", limit=300)
+    replied = {c["in_reply_to_id"] for c in comments if c.get("in_reply_to_id")}
+    return [c for c in comments if not c.get("in_reply_to_id") and c["id"] not in replied]
+
+
+async def _head_ci(sha: str) -> dict:
+    """The latest workflow run on a commit: state none / running / success / failure, the run and its bad jobs."""
+    runs = (await gh().get("actions/runs", head_sha=sha, per_page=5)).get("workflow_runs", [])
+    if not runs:
+        return {"state": "none", "run": None, "bad": [], "jobs": 0}
+    run = runs[0]
+    if run["status"] != "completed":
+        return {"state": "running", "run": run, "bad": [], "jobs": 0}
+    jobs = (await gh().get(f"actions/runs/{run['id']}/jobs", per_page=100)).get("jobs", [])
+    bad = [f"{j['name']}: {j['conclusion']}" for j in jobs if j["conclusion"] not in ("success", "skipped")]
+    ok = run["conclusion"] == "success" and bool(jobs) and not bad
+    return {"state": "success" if ok else "failure", "run": run, "bad": bad or ([] if ok else [str(run["conclusion"])]),
+            "jobs": len(jobs)}
+
+
+def _queue_blockers(author: str, draft: bool, ci_state: str, reviews: list[dict], head: str, waiting: int,
+                    merge: dict) -> list[str]:
+    """What stands between a PR and a merge under AGENTS.md's rules; empty means ready."""
+    out = []
+    if draft:
+        out.append("draft")
+    if ci_state != "success":
+        out.append({"none": "no CI run on its head", "running": "CI running"}.get(ci_state, "CI failed"))
+    if "state" in merge:
+        out.append(merge["state"])
+    elif not merge["clean"]:
+        out.append("conflicts with the default branch: github_pr_sync_main")
+    elif merge["behind"] > _STALE_BEHIND:
+        out.append(f"{merge['behind']} commits behind: github_pr_sync_main")
+    others = [r for r in reviews if r["agent"] != author] if author else reviews
+    verdicts = [r for r in others if r["verdict"] != "comment"]
+    if not verdicts:
+        out.append(f"no review from {'the other agent' if author else 'an agent'}")
+    elif verdicts[-1]["head"] != head:
+        out.append(f"review is for {verdicts[-1]['head'][:8]}, not the head")
+    elif verdicts[-1]["verdict"] == "changes":
+        out.append(f"changes requested by {verdicts[-1]['agent']}")
+    if waiting:
+        out.append(f"{waiting} unanswered review comment(s)")
+    return out
+
+
+@mcp.tool(name="github_pr_wait", annotations=GH_READ)
+async def github_pr_wait(
+    number: Annotated[int, Field(ge=1)],
+    timeout_seconds: Annotated[int, Field(description="Give up and report after this long.", ge=30, le=600)] = 540,
+    review_grace_seconds: Annotated[int, Field(description="After CI finishes, how long to wait for the automated "
+                                                            "review that follows it.", ge=0, le=600)] = 150,
+) -> str:
+    """Wait here, on the server, until CI on the PR's head finishes and the bot review that lands a couple of minutes
+    later has had time to arrive, then report both: one call instead of polling github_ci_status. Returns early with
+    what it has if the head moves or the timeout passes (call it again to keep waiting)."""
+    start = time.monotonic()
+    deadline = start + timeout_seconds
+    head = (await gh().get(f"pulls/{number}"))["head"]["sha"]
+    ci = await _head_ci(head)
+    while ci["state"] in ("none", "running") and time.monotonic() < deadline:
+        await asyncio.sleep(min(_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+        moved = (await gh().get(f"pulls/{number}"))["head"]["sha"]
+        if moved != head:
+            return f"#{number} moved from {head[:8]} to {moved[:8]} while waiting; its CI starts over. Wait again."
+        ci = await _head_ci(head)
+    lines = [f"#{number} at {head[:8]}: CI {ci['state']}" + (f" (run {ci['run']['id']}, {ci['jobs']} jobs)" if ci["run"] else "")]
+    if ci["bad"] and ci["state"] == "failure":
+        lines.append("Failed: " + "; ".join(ci["bad"]) + ". github_ci_status then github_ci_logs show why.")
+    if ci["state"] in ("none", "running"):
+        return "\n".join(lines + [f"Still waiting after {timeout_seconds} s; call github_pr_wait again."])
+    since = ci["run"]["created_at"]
+    grace_end = min(deadline, time.monotonic() + review_grace_seconds)
+    while True:
+        reviews = [r for r in await gh().paged(f"pulls/{number}/reviews", limit=100) if (r.get("submitted_at") or "") >= since]
+        inline = [c for c in await gh().paged(f"pulls/{number}/comments", limit=300) if c["created_at"] >= since]
+        talk = [c for c in await gh().paged(f"issues/{number}/comments", limit=100) if c["created_at"] >= since]
+        if reviews or inline or talk or time.monotonic() >= grace_end:
+            break
+        await asyncio.sleep(min(_POLL_SECONDS, max(0.0, grace_end - time.monotonic())))
+    if not (reviews or inline or talk):
+        lines.append(f"No review or comment since the run started (waited {review_grace_seconds} s after CI).")
+    for r in reviews:
+        lines.append(f"- review by {r['user']['login']} ({r['state']}): {_clip(' '.join((r.get('body') or '').split()), 300)}")
+    for c in inline:
+        lines.append(f"- [{c['id']}] {c['user']['login']} on {c['path']}:{c.get('line') or c.get('original_line')}: "
+                     f"{_clip(' '.join(c['body'].split()), 300)}")
+    for c in talk:
+        lines.append(f"- {c['user']['login']}: {_clip(' '.join(c['body'].split()), 300)}")
+    return "\n".join(lines)
+
+
+@mcp.tool(name="github_pr_review", annotations=GH_WRITE)
+async def github_pr_review(
+    number: Annotated[int, Field(ge=1)],
+    reviewer: Annotated[str, Field(description="Your session owner id, e.g. codex-<thread id> or claude-<session id>.")],
+    verdict: Annotated[Literal["approve", "changes", "comment"], Field(description="approve: OK to merge at this head; "
+                                                                                   "changes: blocks the merge queue.")],
+    body: Annotated[str, Field(description="What you checked (files, tests, risks) and what you found.", min_length=1)],
+    expected_head_sha: Annotated[str, Field(description="The head you reviewed; refused if the PR has moved since.",
+                                            min_length=40, max_length=40)],
+    comments: Annotated[list[dict], Field(description="Inline comments: [{path, line, body}] on the PR's new code.")] = [],
+) -> str:
+    """Record a cross-agent review on the PR itself, where every agent and machine can see it (the board doesn't
+    leave this computer). The verdict is pinned to the head you reviewed: a later push needs a fresh review.
+    github_merge_queue reads it; the PR's author agent can't review its own PR."""
+    agent = _agent_of(reviewer)
+    if not agent:
+        raise ToolError("reviewer must be an agent session id starting with claude- or codex-.")
+    p = await gh().get(f"pulls/{number}")
+    head = p["head"]["sha"]
+    if head != expected_head_sha:
+        raise ToolError(f"#{number} is at {head[:8]}, not {expected_head_sha[:8]}: review the new head.")
+    author = _agent_of(p["head"]["ref"])
+    if author == agent:
+        raise ToolError(f"#{number} ({p['head']['ref']}) is {agent}'s own work; the other agent reviews it.")
+    for c in comments:
+        if not {"path", "line", "body"} <= set(c):
+            raise ToolError("Each inline comment needs path, line and body.")
+    label = {"approve": "Approved", "changes": "Changes requested", "comment": "Comments"}[verdict]
+    payload = {"commit_id": head, "event": "COMMENT",
+               "body": f"{_review_marker(agent, verdict, head)}\n**{label}** by `{reviewer}` at `{head[:8]}`.\n\n{body}",
+               "comments": [{"path": c["path"], "line": int(c["line"]), "side": "RIGHT", "body": c["body"]} for c in comments]}
+    r = (await gh().request("POST", f"pulls/{number}/reviews", json=payload)).json()
+    return f"Posted a '{verdict}' review on #{number} at {head[:8]}: {r.get('html_url', '')}"
+
+
+@mcp.tool(name="github_merge_queue", annotations=GH_READ)
+async def github_merge_queue(
+    include_drafts: Annotated[bool, Field()] = False,
+    limit: Annotated[int, Field(ge=1, le=100)] = 50,
+) -> str:
+    """The integrator's queue: every open PR with CI on its head, the other agent's review of that head, unanswered
+    review comments, whether it merges cleanly and how far behind it is, and a verdict: READY or what blocks it.
+    Ready PRs come first, oldest first; merge them one at a time with github_pr_merge. Fetches origin first."""
+    pulls = await gh().paged("pulls", limit=limit, state="open")
+    if not include_drafts:
+        pulls = [p for p in pulls if not p["draft"]]
+    if not pulls:
+        return "No open pull requests" + ("." if include_drafts else " out of draft.")
+    await asyncio.to_thread(_fetch_origin)
+    default = (await gh().get(gh().repo))["default_branch"]
+    entries = []
+    for p in pulls:
+        head, ref = p["head"]["sha"], p["head"]["ref"]
+        author = _agent_of(ref)
+        same_repo = p["head"]["repo"] and p["head"]["repo"]["full_name"] == f"{gh().owner}/{gh().name}"
+        merge = await asyncio.to_thread(_merge_state, default, ref) if same_repo else {"state": "fork"}
+        ci = await _head_ci(head)
+        reviews = _marked_reviews(await gh().paged(f"pulls/{p['number']}/reviews", limit=100))
+        waiting = len(await _waiting_comments(p["number"]))
+        blockers = _queue_blockers(author, p["draft"], ci["state"], reviews, head, waiting, merge)
+        last = next((r for r in reversed(reviews) if r["agent"] != author and r["verdict"] != "comment"), None)
+        entries.append((bool(blockers), p["created_at"], p, author, ci, last, merge, blockers))
+    entries.sort(key=lambda e: (e[0], e[1]))
+    rows = ["| # | title | by | CI | review | behind | verdict |", "|---|---|---|---|---|---|---|"]
+    for _, _, p, author, ci, last, merge, blockers in entries:
+        review = f"{last['agent']} {last['verdict']} @{last['head'][:7]}" if last else ""
+        rows.append(f"| {p['number']} | {p['title'][:55]} | {author or '?'} | {ci['state']} | {review} | "
+                    f"{merge.get('behind', '')} | {'READY' if not blockers else '; '.join(blockers)} |")
+    ready = sum(1 for e in entries if not e[0])
+    return f"{ready} of {len(entries)} ready to merge into {default}.\n\n" + "\n".join(rows)
+
+
+@mcp.tool(name="github_pr_sync_main", annotations=LOCAL_WRITE)
+async def github_pr_sync_main(
+    push: Annotated[bool, Field(description="Push the merge if it was clean. Default: leave it for your tests first.")] = False,
+) -> str:
+    """Bring this checkout's PR branch up to date: fetch origin and merge (never rebase) the default branch into it.
+    A clean merge is committed; conflicts are left in the tree, listed, for you to resolve keeping both sides' intent,
+    then `git add` and commit. Afterwards rerun the focused tests and skyrunner_project_status, and the reviewer reads
+    skyrunner_merge_resolution. Refuses on a dirty tree, the default branch or a merge already in progress."""
+    branch = _git("rev-parse", "--abbrev-ref", "HEAD")
+    try:
+        default = (await gh().get(gh().repo))["default_branch"]
+    except ToolError:
+        default = "main"
+    if branch in (default, "HEAD"):
+        raise ToolError(f"This checkout is on {branch}; check out the PR's branch in its own worktree first.")
+    if _git("rev-parse", "--verify", "--quiet", "MERGE_HEAD", check=False):
+        raise ToolError("A merge is already in progress here: finish it (resolve, git add, commit) or `git merge --abort`.")
+    if _git("status", "--porcelain", "--untracked-files=no"):
+        raise ToolError("The checkout has uncommitted changes; commit or stash them before merging.")
+    await asyncio.to_thread(_fetch_origin)
+    behind = int(_git("rev-list", "--count", f"HEAD..origin/{default}"))
+    if behind == 0:
+        return f"{branch} already has everything on origin/{default}."
+    r = await asyncio.to_thread(subprocess.run, ["git", "-c", "core.fsmonitor=false", "merge", "--no-ff", "--no-edit",
+                                                 f"origin/{default}"], cwd=ROOT, capture_output=True, text=True)
+    if r.returncode != 0:
+        conflicted = _git("diff", "--name-only", "--diff-filter=U").splitlines()
+        if not conflicted:
+            raise ToolError(f"git merge failed: {_clip((r.stderr or r.stdout).strip(), 1500)}")
+        return (f"Merging {behind} commits of origin/{default} into {branch}: {len(conflicted)} file(s) conflict:\n"
+                + "\n".join(f"- {f}" for f in conflicted)
+                + "\nResolve each keeping both sides' intent, `git add` them and commit; `git merge --abort` gives up.")
+    sha = _git("rev-parse", "HEAD")
+    out = f"Merged {behind} commits of origin/{default} into {branch} as {sha[:8]}, no conflicts."
+    if push:
+        pr = await asyncio.to_thread(subprocess.run, ["git", "push", "origin", f"HEAD:{branch}"], cwd=ROOT,
+                                     capture_output=True, text=True)
+        if pr.returncode != 0:
+            raise ToolError(f"{out} The push failed: {_clip(pr.stderr.strip(), 800)}")
+        return out + " Pushed."
+    return out + " Rerun the focused tests and the project status, then push."
+
+
+@mcp.tool(name="skyrunner_merge_resolution", annotations=READ_ONLY)
+async def skyrunner_merge_resolution(
+    commit: Annotated[str, Field(description="A merge commit: sha, branch or HEAD.", pattern=r"^[0-9A-Za-z_./~^-]{1,100}$")] = "HEAD",
+) -> str:
+    """How a merge commit's conflicts were resolved, and nothing else: `git show --remerge-diff`, the merge compared
+    with what git would have produced on its own. What a reviewer reads after github_pr_sync_main had conflicts."""
+    parents = _git("rev-list", "--parents", "-n", "1", commit).split()
+    if len(parents) < 3:
+        raise ToolError(f"{commit} ({parents[0][:8] if parents else '?'}) is not a merge commit.")
+    out = _git("show", "--remerge-diff", "--format=%H %s", commit)
+    head, _, diff = out.partition("\n")
+    if not diff.strip():
+        return f"{head}\nMerged without conflicts: nothing was resolved by hand."
+    return f"{head}\n\n```diff\n{_clip(diff, MAX_TEXT)}\n```"
+
+
+@mcp.tool(name="github_pr_diff", annotations=GH_READ)
+async def github_pr_diff(
+    number: Annotated[int, Field(ge=1)],
+    path: Annotated[str, Field(description="Only files whose path contains this text; empty = all (the list first).")] = "",
+    max_chars: Annotated[int, Field(ge=1000, le=60000)] = 20000,
+) -> str:
+    """The PR's actual diff as GitHub has it at the head, file by file, so a reviewer on any worktree or machine reads
+    the same source change without a checkout: a list of files with sizes when `path` is empty, the patches of the
+    matching files otherwise. Binary and very large files come without a patch (GitHub omits it)."""
+    p = await gh().get(f"pulls/{number}")
+    files = await gh().paged(f"pulls/{number}/files", limit=300)
+    head = p["head"]["sha"]
+    if not path:
+        rows = [f"- {f['filename']} ({f['status']}, +{f['additions']}/-{f['deletions']}{'' if f.get('patch') else ', no patch'})"
+                for f in files]
+        return (f"#{number} at {head[:8]}: {len(files)} files, +{p['additions']}/-{p['deletions']}. "
+                f"Pass path= to read patches.\n" + "\n".join(rows))
+    hits = [f for f in files if path in f["filename"]]
+    if not hits:
+        raise ToolError(f"No file of #{number} contains {path!r}.")
+    out = [f"#{number} at {head[:8]}: {len(hits)} matching file(s)"]
+    for f in hits:
+        out += ["", f"### {f['filename']} ({f['status']}, +{f['additions']}/-{f['deletions']})",
+                "```diff", f.get("patch") or "(no patch: binary or too large; read it from the branch)", "```"]
+    return _clip("\n".join(out), max_chars)
+
+
 @mcp.tool(name="github_pr_close", annotations=GH_DESTRUCTIVE)
 async def github_pr_close(
     number: Annotated[int, Field(ge=1)],

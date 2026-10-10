@@ -40,6 +40,11 @@ dispatch without authentication. GitHub tools operate on the **game checkout's o
   each worktree has a separate cache. Independent worktrees still compete for host memory.
 - GitHub: PR/issue inspection, CI/logs, authorized PR/issue updates and conservative merge/cleanup tools.
   Tool availability is not permission to publish, merge or send messages.
+- GitHub for two agents: `github_pr_wait` (CI plus the bot review that follows, in one call), `github_pr_review`
+  (a review on the PR, pinned to the head, never by the author agent), `github_merge_queue` (every open PR with
+  its CI, the other agent's review and a READY / blocked verdict), `github_pr_diff` (the diff, file by file),
+  `github_pr_sync_main` and `skyrunner_merge_resolution` (merge the default branch in; read only how conflicts
+  were resolved).
 
 All 30 existing tool names are preserved. The bundled `mcp_introspect.gd` adapter reads the target game's
 compiled command/role/switch definitions, so no server implementation needs to live in the game repository.
