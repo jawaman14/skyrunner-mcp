@@ -21,3 +21,21 @@ shell runs; `SKYRUNNER_MACHINE_LOCK=off` or another path. Windows: guards 2/2, c
 runtime 17/17 with one POSIX skip (2 new), wheel built. Linux is left to CI. Next: independent review, then
 bump the game's pin in a separate game PR. `codex/board-wake` (unpushed) has its own `board_path` in
 `board_channel.py`; it should call `collaboration.board_path` after this merges.
+
+## Lightweight tally (Codex, 11 October 2026)
+
+Branch `codex/score-tally`, base main `3411693`. Read-only `skyrunner-score` CLI uses the game's
+reviewed markdown score log as the only ledger: no new database, mutations, automatic awards or
+individual rankings. It checks point deltas, actors, evidence presence, row IDs and running totals,
+excludes pending entries, and rejects double-counted stable Event IDs. Legacy logs without Event ID
+use row numbers; semantic deduplication and verification of evidence remain reviewer/owner duties.
+New CI step runs eight ledger regressions on Windows/Linux. Locally: tally 8/8, guards 2/2,
+collaboration 11/11, runtime 16 passed +1 POSIX skip, GitHub 9/9; wheel/sdist built.
+Snapshot of game #315@6dc95782 computes team +1, six counted events, five pending seeds; this is a
+draft-ledger snapshot, not a merged/current live total. No score award for ledger administration.
+Update confirmed rows only at normal task delivery/review checkpoints; the integrator batches them.
+Owner requested a Claude/Codex planning round (game board 98/99); existing lead has not replied.
+A separate read-only Claude CLI attempt hit the account session limit (reset 14:20 Sydney); no
+discussion was fabricated and no repeated blocked call made. Round remains queued, with task
+priorities/eligible points proposed on the board. Next: independent review and Linux CI, integrate
+CLI, then complete the actual planning exchange when Claude is available. No merge performed.
