@@ -37,6 +37,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field
 from .collaboration import Board, MachineLock, ProjectLock, board_path, machine_lock_path
+from . import local_llm as _llm
 
 logging.getLogger("httpx").setLevel(logging.WARNING)  # one INFO line per request otherwise
 
@@ -57,6 +58,7 @@ READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempot
 LOCAL_RUN = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False)
 LOCAL_WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=False)
 GH_READ = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True)
+LOCAL_LLM = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True)
 GH_WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=True)
 GH_DESTRUCTIVE = ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=True)
 
@@ -1502,6 +1504,84 @@ def _stop_jobs() -> None:
                 _terminate_job(job)
             except (ProcessLookupError, PermissionError):
                 pass
+
+
+# ----------------------------------------------------------------------------------------------- local model (LM Studio)
+# A cheap first pass on the owner's LM Studio server (SKYRUNNER_LOCAL_LLM). The large model on it must not be disturbed: these tools
+# only use a model that is ALREADY LOADED, never load, unload or download one, never use its MCP integrations, run one request at
+# a time across every agent, and everything they return is a draft for an agent to check: they decide, review, post and merge nothing.
+async def _local(coro):
+    try:
+        return await coro
+    except _llm.LocalLLMError as e:
+        raise ToolError(str(e)) from e
+
+
+@mcp.tool(name="local_llm_status", annotations=LOCAL_LLM)
+async def local_llm_status() -> str:
+    """Which model is loaded on the local LM Studio server, its context window and how many characters of a log or diff the other
+    local_llm_* tools will send. A read-only look at the model list; it loads nothing."""
+    data = await _local(_llm.LocalLLM().models())
+    loaded = _llm.loaded_models(data)
+    ctx = {m["key"]: [i.get("config", {}).get("context_length") for i in m.get("loaded_instances", [])] for m in data.get("models", [])
+           if m.get("type") == "llm" and m.get("loaded_instances")}
+    return (f"Loaded: {', '.join(loaded) or 'none (this server never loads a model; load one in LM Studio)'}\n"
+            f"Context windows: {json.dumps(ctx)}\nInput budget: {_llm.input_budget(data)} characters")
+
+
+@mcp.tool(name="local_llm_digest", annotations=LOCAL_LLM)
+async def local_llm_digest(
+    text: Annotated[str, Field(description="A log or any text to summarise; leave empty to digest a pull request's diff.")] = "",
+    pr: Annotated[int, Field(ge=0, description="A pull request number whose diff to digest (when text is empty).")] = 0,
+    max_lines: Annotated[int, Field(ge=3, le=15)] = 8,
+) -> str:
+    """A short digest of a long log or a PR diff by the local model, exact error text quoted. A first pass only: it does not decide
+    whether a failure matters, and a reader checks the real log when it does."""
+    if bool(text) == bool(pr):
+        raise ToolError("Give either text or pr.")
+    llm = _llm.LocalLLM()
+    budget = _llm.input_budget(await _local(llm.models()))
+    what = "log"
+    if pr:
+        files = await gh().paged(f"pulls/{pr}/files", limit=300)
+        text = "\n".join(f"### {f['filename']} ({f['status']})\n{f.get('patch') or '(no patch)'}" for f in files)
+        what = "pull request diff"
+    return await _local(llm.chat(_llm.DIGEST_PROMPT.format(what=what, lines=max_lines, text=_llm.clip(text, budget)),
+                                 system="You are terse and exact.", max_tokens=450))
+
+
+@mcp.tool(name="local_llm_thread_summaries", annotations=LOCAL_LLM)
+async def local_llm_thread_summaries(number: Annotated[int, Field(ge=1)]) -> str:
+    """For each unanswered top-level review comment on a PR: what is asked, what to check, and an empty reply. A neutral reading, never
+    a verdict (a drafted reply once told a valid blocking finding that no change was needed). Nothing is posted or replied to."""
+    open_ = await _waiting_comments(number)
+    if not open_:
+        return f"#{number}: no unanswered review threads."
+    llm = _llm.LocalLLM()
+    out = [f"#{number}: {len(open_)} unanswered review thread(s). Summaries only, NOT replies: the author decides and writes the answer."]
+    for c in open_[:_llm.MAX_CALLS]:
+        summary = await _local(llm.chat(_llm.THREAD_PROMPT.format(path=c.get("path"), line=c.get("line") or c.get("original_line"),
+                                                                  body=_llm.clip(c.get("body", ""), 3000)),
+                                        system="You summarise review comments neutrally and never decide for the author.", max_tokens=200))
+        out += ["", f"## comment {c['id']} {c.get('path')}:{c.get('line') or c.get('original_line')}", summary]
+    return "\n".join(out)
+
+
+@mcp.tool(name="local_llm_triage", annotations=LOCAL_LLM)
+async def local_llm_triage(limit: Annotated[int, Field(ge=1, le=30)] = 10) -> str:
+    """Open PRs, one line each: the review tier (computed from the changed file paths, no model), who wrote it (branch prefix) and a
+    one-line summary from the local model. The tier is reliable; the summaries are loose, so read them as hints."""
+    prs = await gh().paged("pulls", limit=limit)
+    llm = _llm.LocalLLM()
+    lines = []
+    for p in prs[:limit]:
+        files = await gh().paged(f"pulls/{p['number']}/files", limit=300)
+        paths = [f["filename"] for f in files]
+        ref = (p.get("head") or {}).get("ref", "")
+        who = "claude" if ref.startswith("claude/") else ("codex" if ref.startswith("codex/") else "?")
+        one = await _local(llm.chat(_llm.TRIAGE_PROMPT.format(title=p["title"], files=", ".join(paths[:12])), max_tokens=60))
+        lines.append(f"#{p['number']} tier {_llm.tier_of(paths)}, authored by {who}{' (draft)' if p.get('draft') else ''}: {one.splitlines()[0]}")
+    return "\n".join(lines) or "No open pull requests."
 
 
 def main() -> None:
