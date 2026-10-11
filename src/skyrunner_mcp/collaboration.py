@@ -8,9 +8,39 @@ import uuid
 from contextlib import contextmanager
 
 
+def board_path(git_common_dir):
+    """The board file. $SKYRUNNER_BOARD (absolute) lets separate clones on one machine share a board; otherwise it
+    sits in the clone's Git common directory, which only that clone's linked worktrees share."""
+    override = os.environ.get("SKYRUNNER_BOARD", "").strip()
+    if override:
+        path = Path(override).expanduser()
+        if not path.is_absolute():
+            raise ValueError("SKYRUNNER_BOARD must be an absolute path to the board's .sqlite3 file.")
+        return path
+    return Path(git_common_dir).resolve() / "skyrunner-mcp" / "collaboration.sqlite3"
+
+
+def machine_lock_path():
+    """One lock per user and machine, so Godot jobs from every checkout and worktree run one at a time.
+    $SKYRUNNER_MACHINE_LOCK names another file (absolute), or "off" to keep only the per-checkout lock."""
+    value = os.environ.get("SKYRUNNER_MACHINE_LOCK", "").strip()
+    if value.lower() == "off":
+        return None
+    if value:
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            raise ValueError("SKYRUNNER_MACHINE_LOCK must be an absolute path or off.")
+        return path
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    else:
+        base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    return base / "skyrunner-mcp" / "godot-machine.lock"
+
+
 class ProjectLock:
     """Kernel lock held until the job ends. A crashed server releases the handle."""
-    def __init__(self, path):
+    def __init__(self, path, busy="Another MCP client is using this checkout's Godot cache; wait for its job to finish."):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         self.handle = path.open("a+b")
@@ -28,7 +58,7 @@ class ProjectLock:
                 fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             self.handle.close()
-            raise RuntimeError("Another MCP client is using this checkout's Godot cache; wait for its job to finish.")
+            raise RuntimeError(busy)
 
     def close(self):
         if not self.handle.closed:
@@ -40,6 +70,31 @@ class ProjectLock:
                 import fcntl
                 fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
             self.handle.close()
+
+
+class MachineLock:
+    """The machine-wide Godot lock, with a note of its holder so a refusal can say who is running."""
+    def __init__(self, path, holder):
+        path = Path(path)
+        info = path.with_name(path.name + ".holder.json")
+        try:
+            self.lock = ProjectLock(path)
+        except RuntimeError:
+            try:
+                who = json.loads(info.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                who = {}
+            detail = f": {who.get('kind')} in {who.get('root')} (pid {who.get('pid')})" if who else ""
+            raise RuntimeError(f"Another Godot job is running on this machine{detail}. One runs at a time across all "
+                               "checkouts and worktrees, because two can exhaust the memory; wait for it to finish, "
+                               "or set SKYRUNNER_MACHINE_LOCK=off on a machine with room for both.") from None
+        try:
+            info.write_text(json.dumps(holder), encoding="utf-8")
+        except OSError:
+            pass  # the note only improves the refusal message
+
+    def close(self):
+        self.lock.close()
 
 
 def clean_paths(paths):

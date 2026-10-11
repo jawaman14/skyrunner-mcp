@@ -23,6 +23,7 @@ fixture_root = Path(fixture.name)
 (fixture_root / "tests").mkdir()
 (fixture_root / "tests/test_docs.gd").write_text("func test_example():\n    pass\n", encoding="utf-8")
 os.environ["SKYRUNNER_ROOT"] = str(fixture_root)
+os.environ["SKYRUNNER_MACHINE_LOCK"] = str(fixture_root / "godot-machine.lock")  # never the real machine's lock
 from skyrunner_mcp import server, run_tests as worker
 
 
@@ -60,6 +61,31 @@ class Runtime(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(server.JOBS, {})
         finally:
             lock.close()
+
+    async def test_machine_lock_held_elsewhere_refuses_spawn(self):
+        lock = server.MachineLock(server.MACHINE_LOCK, {"kind": "tests", "root": "other-worktree", "pid": 1})
+        try:
+            with self.assertRaises(server.ToolError) as caught, \
+                    patch.object(server.asyncio, "create_subprocess_exec") as spawn:
+                await server._start_job("blocked", [sys.executable, "-c", "pass"], server._summarize_plain)
+            spawn.assert_not_called()
+            self.assertIn("other-worktree", str(caught.exception))
+            self.assertEqual(server.JOBS, {})
+            server.ProjectLock(server.WORK / "godot-cache.lock").close()  # the checkout's own lock was given back
+        finally:
+            lock.close()
+
+    async def test_finished_job_releases_machine_lock(self):
+        job = await server._start_job("fixture", [sys.executable, "-c", "pass"], server._summarize_plain, timeout_s=10)
+        await server._wait(job, 10)
+        for _ in range(50):
+            try:
+                server.MachineLock(server.MACHINE_LOCK, {}).close()
+                break
+            except RuntimeError:
+                await asyncio.sleep(0.05)
+        else:
+            self.fail("the machine lock is still held after the job ended")
 
     async def test_failed_spawn_releases_cache_lock(self):
         # Exercise create_subprocess_exec failure on both platforms. GNU timeout itself starts

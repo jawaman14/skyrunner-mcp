@@ -5,9 +5,12 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
-from skyrunner_mcp.collaboration import Board, ProjectLock
+from skyrunner_mcp.collaboration import Board, MachineLock, ProjectLock, board_path, machine_lock_path
+
+SRC = str(Path(__file__).resolve().parents[1] / "src")
 
 
 class Coordination(unittest.TestCase):
@@ -86,6 +89,63 @@ class Coordination(unittest.TestCase):
             lock.close()
         result = subprocess.run([sys.executable, "-c", code, str(path)], env=env, capture_output=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_board_path_follows_override(self):
+        common = self.root / "repo.git"
+        with patch.dict(os.environ, {"SKYRUNNER_BOARD": ""}):
+            self.assertEqual(board_path(common), common.resolve() / "skyrunner-mcp" / "collaboration.sqlite3")
+        shared = self.root / "shared" / "board.sqlite3"
+        with patch.dict(os.environ, {"SKYRUNNER_BOARD": str(shared)}):
+            self.assertEqual(board_path(common), shared)
+        with patch.dict(os.environ, {"SKYRUNNER_BOARD": "relative/board.sqlite3"}), self.assertRaises(ValueError):
+            board_path(common)
+
+    def test_machine_lock_path_settings(self):
+        with patch.dict(os.environ, {"SKYRUNNER_MACHINE_LOCK": "OFF"}):
+            self.assertIsNone(machine_lock_path())
+        with patch.dict(os.environ, {"SKYRUNNER_MACHINE_LOCK": str(self.root / "m.lock")}):
+            self.assertEqual(machine_lock_path(), self.root / "m.lock")
+        with patch.dict(os.environ, {"SKYRUNNER_MACHINE_LOCK": "m.lock"}), self.assertRaises(ValueError):
+            machine_lock_path()
+        with patch.dict(os.environ, {"SKYRUNNER_MACHINE_LOCK": ""}):
+            self.assertEqual(machine_lock_path().parts[-2:], ("skyrunner-mcp", "godot-machine.lock"))
+
+    def test_machine_lock_names_its_holder_and_releases(self):
+        path = self.root / "godot-machine.lock"
+        code = ("from skyrunner_mcp.collaboration import MachineLock; import sys\n"
+                "try: MachineLock(sys.argv[1], {}).close()\n"
+                "except RuntimeError as e: print(e); sys.exit(2)")
+        env = {**os.environ, "PYTHONPATH": SRC}
+        lock = MachineLock(path, {"kind": "tests", "root": "C:/worktree-a", "pid": 1})
+        try:
+            result = subprocess.run([sys.executable, "-c", code, str(path)], env=env, capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("tests in C:/worktree-a", result.stdout)
+        finally:
+            lock.close()
+        result = subprocess.run([sys.executable, "-c", code, str(path)], env=env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_shell_wrapper_refuses_or_waits_while_held(self):
+        path = self.root / "godot-machine.lock"
+        env = {**os.environ, "PYTHONPATH": SRC, "SKYRUNNER_MACHINE_LOCK": str(path)}
+        run = [sys.executable, "-m", "skyrunner_mcp.locked"]
+        command = ["--", sys.executable, "-c", "print('ran')"]
+        lock = MachineLock(path, {"kind": "tests", "root": "elsewhere", "pid": 1})
+        try:
+            result = subprocess.run(run + command, env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 75, result.stderr)
+            self.assertNotIn("ran", result.stdout)
+            waiting = subprocess.Popen(run + ["--wait"] + command, env=env, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, text=True)
+            time.sleep(2)
+            self.assertIsNone(waiting.poll(), "--wait must not run the command while the lock is held")
+        finally:
+            lock.close()
+        stdout, stderr = waiting.communicate(timeout=30)
+        self.assertEqual(waiting.returncode, 0, stderr)
+        self.assertIn("Waiting", stderr)
+        self.assertIn("ran", stdout)
 
 
 if __name__ == "__main__":

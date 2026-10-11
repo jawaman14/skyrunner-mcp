@@ -4,8 +4,9 @@ The owner authorized simultaneous Claude/Codex collaboration on 11 October 2026.
 Use the same Skyrunner MCP implementation and shared board. Each stdio client starts its own process;
 the board lives under the repository's Git common directory, so linked worktrees on this computer see
 the same tasks and notes. This does not launch Claude, expose either agent's chat, or connect a cloud
-checkout to this computer. Separate clones/machines need committed HANDOFF notes or an explicitly
-configured remote service; their local boards are separate.
+checkout to this computer. A second clone on the same computer gets its own empty board unless every
+client sets `SKYRUNNER_BOARD` to one absolute path; other machines need committed HANDOFF notes or an
+explicitly configured remote service.
 
 ## Start every session
 
@@ -55,8 +56,13 @@ All server processes targeting the same checkout use a kernel lock for `.build/m
 Imports, tests, smoke, balance, screenshots and introspection use that guard. A competing job is refused
 until the current job exits; logs have process/UUID identifiers so clients cannot overwrite each other.
 Job IDs and cancellation belong to the process that started them. Tell the other agent which job/checkout
-is busy; do not cancel its work from a shell. Different worktrees have separate caches and may run jobs
-in parallel if host memory permits. After a forced server crash, inspect for surviving Godot descendants
+is busy; do not cancel its work from a shell. Different worktrees have separate caches, but a second kernel
+lock, one per user and machine (`%LOCALAPPDATA%\skyrunner-mcp\godot-machine.lock`, or
+`~/.cache/skyrunner-mcp/` elsewhere), still runs one Godot job at a time across all of them: two overlapping
+runs once ran Windows out of commit memory. The refusal names the holder's job and checkout. Set
+`SKYRUNNER_MACHINE_LOCK=off` only on a machine with room for both, or to another absolute path. For Godot runs
+started from a shell, use `skyrunner-godot-lock --wait -- bash tools/test.sh <filter>` so they queue behind
+server jobs instead of competing with them. After a forced server crash, inspect for surviving Godot descendants
 before starting another job; do not assume a released handle proves all descendants exited.
 
 ## Client setup

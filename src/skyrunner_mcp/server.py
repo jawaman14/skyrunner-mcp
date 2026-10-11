@@ -36,7 +36,7 @@ from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field
-from .collaboration import Board, ProjectLock
+from .collaboration import Board, MachineLock, ProjectLock, board_path, machine_lock_path
 
 logging.getLogger("httpx").setLevel(logging.WARNING)  # one INFO line per request otherwise
 
@@ -47,6 +47,10 @@ SERVER_DIR = Path(__file__).resolve().parent
 if not (ROOT / "project.godot").is_file():
     raise RuntimeError("SKYRUNNER_ROOT must be a Skyrunner checkout containing project.godot.")
 WORK = ROOT / ".build" / "mcp"  # .build/ is gitignored
+try:
+    MACHINE_LOCK = machine_lock_path()  # Godot jobs from every checkout run one at a time; None when turned off
+except ValueError as e:
+    raise RuntimeError(str(e)) from e
 MAX_TEXT = 12000  # characters of log returned in one tool result
 
 READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False)
@@ -85,10 +89,14 @@ def _git(*args: str, check: bool = True) -> str:
 
 def _board() -> Board:
     # All linked worktrees share this Git common directory; no host-specific path in tracked config.
+    # SKYRUNNER_BOARD, set in a client's environment, points separate clones on one machine at one board.
     common = Path(_git("rev-parse", "--git-common-dir"))
     if not common.is_absolute():
         common = ROOT / common
-    return Board(common.resolve() / "skyrunner-mcp" / "collaboration.sqlite3")
+    try:
+        return Board(board_path(common))
+    except ValueError as e:
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool(name="skyrunner_collaboration_read", annotations=READ_ONLY)
@@ -247,9 +255,20 @@ async def _start_job(kind: str, command: list[str], summarize, env: dict | None 
     except RuntimeError as e:
         raise ToolError(str(e)) from e
     try:
+        machine_lock = MachineLock(MACHINE_LOCK, {"kind": kind, "root": str(ROOT), "pid": os.getpid(),
+                                                  "started": time.time()}) if MACHINE_LOCK else None
+    except RuntimeError as e:
+        cache_lock.close()
+        raise ToolError(str(e)) from e
+
+    def release() -> None:
+        if machine_lock:
+            machine_lock.close()
+        cache_lock.close()
+    try:
         handle = log.open("wb")
     except BaseException:
-        cache_lock.close()
+        release()
         raise
     wrapped = ["timeout", "--kill-after=10", str(timeout_s), *command] if os.name != "nt" and shutil.which("timeout") else command
     platform_options = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {"start_new_session": True}
@@ -257,7 +276,7 @@ async def _start_job(kind: str, command: list[str], summarize, env: dict | None 
         proc = await asyncio.create_subprocess_exec(*wrapped, cwd=ROOT, env=full_env, stdout=handle,
                                                     stderr=asyncio.subprocess.STDOUT, **platform_options)
     except BaseException:
-        cache_lock.close()
+        release()
         raise
     finally:
         handle.close()
@@ -269,7 +288,7 @@ async def _start_job(kind: str, command: list[str], summarize, env: dict | None 
             await proc.wait()
             job.ended = time.time()
         finally:
-            cache_lock.close()
+            release()
     asyncio.create_task(_reap())
     if wrapped is command:
         async def _deadline() -> None:

@@ -11,3 +11,13 @@ The game migration changes its launcher/client configurations and CI to consume 
 The game PR remains separate and requires review; do not merge it automatically. Client reload and
 actual Claude participation remain user-side steps. Local Godot validation may be constrained by
 Windows committed-memory pressure; a zero-test or failed job is not success.
+
+## Shared board path and machine-wide Godot lock (Claude, 11 October 2026)
+
+Branch `claude/shared-board-machine-lock` from main `faee6dc`. `SKYRUNNER_BOARD` points separate clones on one
+machine at one board file (a second clone used to get its own empty board). `MachineLock` (per user and machine)
+now joins the per-checkout lock in every Godot job, and `skyrunner-godot-lock [--wait] -- <cmd>` takes it for
+shell runs; `SKYRUNNER_MACHINE_LOCK=off` or another path. Windows: guards 2/2, collaboration 11/11 (4 new),
+runtime 17/17 with one POSIX skip (2 new), wheel built. Linux is left to CI. Next: independent review, then
+bump the game's pin in a separate game PR. `codex/board-wake` (unpushed) has its own `board_path` in
+`board_channel.py`; it should call `collaboration.board_path` after this merges.
