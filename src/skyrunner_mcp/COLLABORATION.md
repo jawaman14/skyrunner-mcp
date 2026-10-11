@@ -50,6 +50,19 @@ Claims are advisory coordination, not access control: shell/editor writes are no
 strings are client-supplied. Both agents must follow this protocol. Do not put tokens or private credentials
 in notes. Notes do not wake the recipient; it sees them on its next board read.
 
+## Reviews and merging on GitHub
+
+Both agents act as the owner's GitHub account, which cannot approve its own PR, so a review's verdict sits in a
+marker in the review body, pinned to the head it was written for, and the branch prefix (`claude/`, `codex/`) says
+who wrote the PR. The loop:
+
+1. Author: `github_pr_sync_main` (merge, never rebase; resolve any conflicts), rerun the focused tests, push,
+   then `github_pr_wait` for CI and the bot review.
+2. Reviewer, on any worktree or machine: `github_pr_diff` to read the change (and `skyrunner_merge_resolution` on
+   the merge commit), then `github_pr_review` with `approve` or `changes` at that exact head.
+3. Lead: `github_merge_queue` shows what is READY and what blocks the rest; merge one at a time with
+   `github_pr_merge`. A push after a review needs a fresh review.
+
 ## Shared Godot jobs
 
 All server processes targeting the same checkout use a kernel lock for `.build/mcp/godot-cache.lock`.
