@@ -43,6 +43,19 @@ class Runtime(unittest.IsolatedAsyncioTestCase):
         self.work.stop()
         self.temp.cleanup()
 
+    async def test_compact_inbox_tool_preserves_complete_notes_and_cursor(self):
+        from skyrunner_mcp.collaboration import Board
+        board = Board(Path(self.temp.name) / "board.sqlite3")
+        note = board.note("claude-session", "codex", "review at exact SHA")
+        with patch.object(server, "_board", return_value=board):
+            result = json.loads(await server.skyrunner_collaboration_inbox("codex", limit=1))
+            self.assertEqual(result["notes"][0]["id"], note)
+            self.assertNotIn("tasks", result)
+            self.assertFalse(result["has_more"])
+            self.assertEqual(result["next_cursor"], note)
+            with self.assertRaises(server.ToolError):
+                await server.skyrunner_collaboration_inbox("invalid")
+
     async def test_completed_job(self):
         output = "TEST FILE: test_fixture.gd — 1 passed, 0 failed\n1 passed, 0 failed in 0.1 s\n"
         command = "import sys; sys.stdout.buffer.write(%r)" % output.encode("utf-8")
@@ -226,6 +239,14 @@ class Runtime(unittest.IsolatedAsyncioTestCase):
                 inbox = await claude.call_tool("skyrunner_collaboration_read", {"recipient": "claude"})
                 self.assertIn("Ready for review", inbox.content[0].text)
                 self.assertIn("codex-test", inbox.content[0].text)
+                compact = await claude.call_tool("skyrunner_collaboration_inbox", {"recipient": "claude", "limit": 1})
+                self.assertFalse(compact.is_error)
+                page = json.loads(compact.content[0].text)
+                self.assertNotIn("tasks", page)
+                self.assertEqual(page["notes"][0]["text"], "Ready for review")
+                self.assertEqual(page["active_claims"][0]["id"], task)
+                again = await claude.call_tool("skyrunner_collaboration_inbox", {"recipient": "claude", "after": page["next_cursor"]})
+                self.assertEqual(json.loads(again.content[0].text)["notes"], [])
                 wrong_owner = await claude.call_tool("skyrunner_collaboration_update", {"task_id": task, "owner": "claude-test", "status": "done"})
                 self.assertTrue(wrong_owner.is_error)
                 released = await codex.call_tool("skyrunner_collaboration_update", {"task_id": task, "owner": "codex-test", "status": "review", "detail": "abc123; tests passed"})

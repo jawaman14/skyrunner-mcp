@@ -106,6 +106,21 @@ async def skyrunner_collaboration_read(after: int = 0, recipient: Literal["all",
     return json.dumps(_board().read(after, recipient, limit), ensure_ascii=False)
 
 
+@mcp.tool(name="skyrunner_collaboration_inbox", annotations=READ_ONLY)
+async def skyrunner_collaboration_inbox(recipient: Literal["claude", "codex"],
+                                       after: Annotated[int, Field(ge=0)] = 0,
+                                       limit: Annotated[int, Field(ge=1, le=100)] = 10) -> str:
+    """Compact poll: new addressed/shared notes and all active claims, without task history.
+
+    Save next_cursor; read again while has_more is true. Notes are complete, never clipped.
+    Use collaboration_read for task history. This does not acknowledge delivery or grant authorization.
+    """
+    try:
+        return json.dumps(_board().inbox(recipient, after, limit), ensure_ascii=False)
+    except ValueError as e:
+        raise ToolError(str(e)) from e
+
+
 @mcp.tool(name="skyrunner_collaboration_claim", annotations=LOCAL_RUN)
 async def skyrunner_collaboration_claim(owner: str, title: str, paths: list[str],
                                        minutes: Annotated[int, Field(ge=5, le=240)] = 60) -> str:

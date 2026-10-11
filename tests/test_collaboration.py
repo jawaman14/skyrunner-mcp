@@ -60,6 +60,52 @@ class Coordination(unittest.TestCase):
         self.assertEqual(page["notes"][0]["text"], "Shared checkpoint")
         self.assertEqual(self.board.read(page["next_cursor"], recipient="claude")["notes"], [])
 
+    def test_inbox_excludes_history_but_keeps_every_active_claim(self):
+        done = self.claim(["finished.gd"])
+        self.board.update(done, "codex-session-1", "done", "long historic evidence" * 100)
+        first = self.claim(["one.gd"])
+        second = self.claim(["two.gd"], "claude-session-2")
+        page = self.board.inbox("codex", limit=1)
+        self.assertNotIn("tasks", page)
+        self.assertEqual({x["id"] for x in page["active_claims"]}, {first, second})
+        self.assertEqual(page["notes"], [])
+        self.assertFalse(page["has_more"])
+        with patch("skyrunner_mcp.collaboration.time.time", return_value=10**12):
+            self.assertEqual(self.board.inbox("codex")["active_claims"], [])
+
+    def test_inbox_filtered_pagination_never_skips_addressed_notes(self):
+        a = self.board.note("claude-2", "codex", "first")
+        self.board.note("codex-1", "claude", "other inbox")
+        b = self.board.note("claude-2", "all", "second")
+        c = self.board.note("claude-2", "codex", "third")
+        high = self.board.note("codex-1", "claude", "last unrelated")
+        page = self.board.inbox("codex", limit=2)
+        self.assertEqual([x["id"] for x in page["notes"]], [a, b])
+        self.assertTrue(page["has_more"])
+        self.assertEqual(page["next_cursor"], b)
+        page = Board(self.board.path).inbox("codex", page["next_cursor"], 2)
+        self.assertEqual([x["id"] for x in page["notes"]], [c])
+        self.assertFalse(page["has_more"])
+        self.assertEqual(page["next_cursor"], high)
+        self.assertEqual(self.board.inbox("codex", high)["notes"], [])
+        late = self.board.note("claude-2", "codex", "arrived after poll")
+        self.assertEqual(self.board.inbox("codex", high)["notes"][0]["id"], late)
+
+    def test_inbox_exact_limit_and_full_note_text(self):
+        text = "é漢🙂" * 2000
+        self.board.note("claude-2", "codex", text)
+        page = self.board.inbox("codex", limit=1)
+        self.assertFalse(page["has_more"])
+        self.assertEqual(page["notes"][0]["text"], text)
+        self.assertEqual(self.board.inbox("codex", 99)["next_cursor"], 99)
+
+    def test_inbox_validation(self):
+        for kwargs in ({"recipient": "all"}, {"recipient": "invalid"},
+                       {"recipient": "codex", "after": -1},
+                       {"recipient": "codex", "limit": 0}, {"recipient": "codex", "limit": 101}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                self.board.inbox(**kwargs)
+
     def test_invalid_paths_and_note_tasks(self):
         for path in ("../secret", "/absolute", "C:/secret", "scripts/../sim", "scripts//ui", ""):
             with self.subTest(path=path), self.assertRaises(ValueError):
