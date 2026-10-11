@@ -1,6 +1,7 @@
 """The collaboration GitHub tools: waiting on CI, cross-agent reviews, the merge queue, syncing with the default
 branch and reading a merge's resolution. GitHub is faked; git runs on throwaway repositories. No network."""
 import asyncio
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -234,6 +235,31 @@ class Packet(unittest.IsolatedAsyncioTestCase):
         tools = {t.name: t for t in await server.mcp.list_tools()}
         self.assertIn("github_review_packet", tools)
         self.assertTrue(tools["github_review_packet"].annotations.read_only_hint)
+
+
+class States(unittest.IsolatedAsyncioTestCase):
+    async def test_the_states_are_json_with_the_full_head_marked_reviews_waiting_threads_and_merged_numbers(self):
+        comments = [{"id": 1, "path": "a.gd", "line": 3, "user": {"login": "bot"}, "body": "unanswered"},
+                    {"id": 2, "path": "b.gd", "line": 4, "user": {"login": "bot"}, "body": "answered"}, {"id": 3, "in_reply_to_id": 2, "user": {"login": "me"}, "body": "ok"}]
+
+        class Fake(FakeGitHub):
+            async def paged(self, path, **kwargs):
+                if path == "pulls" and kwargs.get("state") == "closed":
+                    return [{"number": 5, "merged_at": "2026-10-11T00:00:00Z"}, {"number": 6, "merged_at": None}]
+                return await super().paged(path, **kwargs)
+
+        fake = Fake(reviews=[review("codex", "approve", HEAD)], comments=comments)
+        with patch.object(server, "gh", return_value=fake):
+            data = json.loads(await server.github_pr_states())
+        self.assertEqual(data["merged"], [5], "closed without a merge is not merged")
+        pr = data["open"][0]
+        self.assertEqual((pr["number"], pr["head"], pr["branch"], pr["ci"]), (7, HEAD, "claude/feature", "success"))
+        self.assertEqual(pr["reviews"], [{"agent": "codex", "verdict": "approve", "head": HEAD}])
+        self.assertEqual([w["id"] for w in pr["waiting"]], [1])
+
+    async def test_the_tool_is_registered_read_only(self):
+        tools = {t.name: t for t in await server.mcp.list_tools()}
+        self.assertTrue(tools["github_pr_states"].annotations.read_only_hint)
 
 
 class Sync(unittest.IsolatedAsyncioTestCase):

@@ -1266,7 +1266,7 @@ def _is_test_path(path: str) -> bool:
 
 
 @mcp.tool(name="github_review_packet", annotations=GH_READ)
-async def github_review_packet(number: Annotated[int, Field(ge=1)], diff_lines: Annotated[int, Field(ge=0, le=400)] = 0) -> str:
+async def github_review_packet(number: Annotated[int, Field(ge=1)], diff_lines: Annotated[int, Field(ge=0, le=5000)] = 0) -> str:
     """One bounded read of a pull request at its CURRENT head, for a reviewer: the full head sha, files with sizes, the tests that sit
     beside changed files by name (a heuristic, not dependency analysis), CI with the failing jobs named, every agent review marked CURRENT or
     STALE against the head, the review bodies of current reviews, the unanswered review threads, and optionally the first `diff_lines` lines of
@@ -1325,6 +1325,34 @@ async def github_review_packet(number: Annotated[int, Field(ge=1)], diff_lines: 
     if now != head:
         out.append(f"WARNING: the head moved while this was read (now {now[:8]}); run it again.")
     return "\n".join(out)
+
+
+@mcp.tool(name="github_pr_states", annotations=GH_READ)
+async def github_pr_states(
+    limit: Annotated[int, Field(ge=1, le=60)] = 40,
+    merged_limit: Annotated[int, Field(ge=0, le=30)] = 10,
+) -> str:
+    """The open PRs as JSON for a program to read (the alert feed): per PR its number, title, FULL head sha, branch, draft flag, whether it merges
+    cleanly, CI state on the head with the failing jobs, the marked agent reviews (agent, verdict, head), and the ids of unanswered review
+    threads; plus the numbers of recently merged PRs. The same facts as github_merge_queue, without the prose."""
+    pulls = await gh().paged("pulls", limit=limit, state="open")
+    rows = []
+    for p in pulls:
+        head = p["head"]["sha"]
+        n = p["number"]
+        ci = await _head_ci(head)
+        reviews = _marked_reviews(await gh().paged(f"pulls/{n}/reviews", limit=100))
+        waiting = await _waiting_comments(n)
+        rows.append({"number": n, "title": p["title"], "head": head, "branch": p["head"]["ref"], "draft": bool(p["draft"]),
+                     "mergeable": p.get("mergeable"), "ci": ci["state"], "ci_bad": ci["bad"],
+                     "reviews": [{"agent": r["agent"], "verdict": r["verdict"], "head": r["head"]} for r in reviews],
+                     "waiting": [{"id": c["id"], "path": c.get("path"), "line": c.get("line") or c.get("original_line"),
+                                  "body": " ".join(str(c.get("body", "")).split())[:600]} for c in waiting[:20]]})
+    merged = []
+    if merged_limit:
+        done = await gh().paged("pulls", limit=merged_limit, state="closed", sort="updated", direction="desc")
+        merged = [p["number"] for p in done if p.get("merged_at")][:merged_limit]
+    return json.dumps({"open": rows, "merged": merged})
 
 
 @mcp.tool(name="github_pr_sync_main", annotations=LOCAL_WRITE)
