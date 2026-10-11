@@ -77,6 +77,34 @@ real GitHub writes. Windows/Linux CI runs the same checks. Actual game integrati
 validation in the game's repository. After server updates, reconnect clients; running clients do not
 hot-load tools. See [SOURCE.md](SOURCE.md) for extraction provenance.
 
+## Diagnose noisy Godot logs
+
+Claude (or Codex) can index an existing log without rerunning the failed job:
+
+```text
+skyrunner-log-digest /absolute/path/to/job.log --limit 30
+```
+
+Before installation, set `PYTHONPATH` to this worktree's `src` directory and run
+`python -m skyrunner_mcp.log_digest /absolute/path/to/job.log`. The tool is read-only and
+does not require a client restart, Godot run, board write or network call.
+Alternatively invoke `python /absolute/path/to/src/skyrunner_mcp/log_digest.py LOG`
+directly; this standalone helper needs only Python's standard library.
+
+JSON groups repeated diagnostic text plus immediately following source/traceback locations,
+with occurrence counts and first/last log line numbers. Distinct locations stay distinct;
+diagnostic text is not clipped. Test summaries remain in source order. Missing summaries,
+zero tests, failed tests and omitted groups are explicit flags. Exit zero means indexing
+succeeded; `verdict` is always `not_assessed`. It cannot certify the job's exit status,
+complete output, test coverage or absence of errors in an unrecognized format. Read the
+original log at the returned line numbers when investigating, and use actual job/CI status
+for acceptance. Timestamp-prefixed repeats may remain separate groups.
+
+Recipient validation: Claude should use a real existing failing log, compare the digest to
+the full log and report whether it reduced investigation effort while retaining the needed
+diagnostics. No reward is earned for implementing or merely demonstrating compression;
+the owner's requested +1 remains pending until actual improvement is confirmed.
+
 ## Licences
 
 MIT, copyright 2026 jawaman14; the original notice is retained in [LICENSE](LICENSE). Dependencies retain
