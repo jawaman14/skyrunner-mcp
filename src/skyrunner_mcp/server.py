@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import contextvars
 import hashlib
 import json
 import logging
@@ -728,8 +729,8 @@ def _token(required: bool = True) -> str:
 
 
 class GitHub:
-    def __init__(self) -> None:
-        self.owner, self.name = _repo()
+    def __init__(self, repo: str = "") -> None:
+        self.owner, self.name = repo.split("/", 1) if repo else _repo()
         self.base = os.environ.get("SKYRUNNER_GITHUB_API", "https://api.github.com").rstrip("/")
         token = _token(required=False)
         self.authenticated = bool(token)
@@ -777,13 +778,48 @@ class GitHub:
 
 
 _gh: GitHub | None = None
+_gh_other: dict[str, GitHub] = {}
+_repo_var: contextvars.ContextVar[str] = contextvars.ContextVar("skyrunner_github_repo", default="")
+# Repositories (besides the default one this server is rooted in) that the PR tools with a `repo` argument may reach. Comma-separated
+# owner/name pairs in SKYRUNNER_EXTRA_REPOS; the default is this server's own repository, which the agents also review and merge.
+DEFAULT_EXTRA_REPOS = "jawaman14/skyrunner-mcp"
+
+
+def _allowed_repos() -> set[str]:
+    owner, name = _repo()
+    allowed = {f"{owner}/{name}".lower()}
+    for item in os.environ.get("SKYRUNNER_EXTRA_REPOS", DEFAULT_EXTRA_REPOS).split(","):
+        if item.strip():
+            allowed.add(item.strip().lower())
+    return allowed
+
+
+def _use_repo(repo: str | None) -> None:
+    """Point this tool call's `gh()` at `repo` (owner/name) instead of the default repository. Refuses a repository that is not allowed."""
+    if not repo:
+        return
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+        raise ToolError(f"repo must be owner/name, not {repo!r}.")
+    if repo.lower() not in _allowed_repos():
+        raise ToolError(f"{repo} is not an allowed repository (allowed: {', '.join(sorted(_allowed_repos()))}; "
+                        f"set SKYRUNNER_EXTRA_REPOS to add one).")
+    _repo_var.set(repo)
 
 
 def gh() -> GitHub:
     global _gh
+    other = _repo_var.get()
+    if other:
+        if other not in _gh_other:
+            _gh_other[other] = GitHub(other)
+        return _gh_other[other]
     if _gh is None:
         _gh = GitHub()
     return _gh
+
+
+REPO_ARG = Annotated[str | None, Field(description="Optional owner/name of another allowed repository (default: this project's repository). "
+                                                   "Lets the PR tools work on the skyrunner-mcp server repository too.")]
 
 
 def _when(ts: str | None) -> str:
@@ -869,9 +905,11 @@ async def _ref_for(ref: str) -> tuple[str, str]:
 async def github_ci_status(
     ref: Annotated[str, Field(description="PR number (e.g. '293'), branch or commit sha; empty = current branch.")] = "",
     runs: Annotated[int, Field(description="How many recent workflow runs to list.", ge=1, le=20)] = 3,
+    repo: REPO_ARG = None,
 ) -> str:
     """GitHub Actions runs for a PR/branch/commit and the per-job results of the latest one, with the job ids that
     github_ci_logs takes. The workflow is .github/workflows/skyrunner-beta.yml (test lanes, exports, smoke)."""
+    _use_repo(repo)
     kind, value = await _ref_for(ref)
     params = {"head_sha": value} if kind == "sha" else {"branch": value}
     data = await gh().get("actions/runs", per_page=runs, **params)
@@ -912,8 +950,9 @@ async def github_ci_logs(
 
 
 @mcp.tool(name="github_pr_view", annotations=GH_READ)
-async def github_pr_view(number: Annotated[int, Field(ge=1)]) -> str:
+async def github_pr_view(number: Annotated[int, Field(ge=1)], repo: REPO_ARG = None) -> str:
     """A PR's description, mergeability, changed files, reviews and inline review comments (unresolved context)."""
+    _use_repo(repo)
     p = await gh().get(f"pulls/{number}")
     files = await gh().paged(f"pulls/{number}/files", limit=300)
     reviews = await gh().paged(f"pulls/{number}/reviews", limit=100)
@@ -968,8 +1007,10 @@ async def github_pr_comment(
     body: Annotated[str, Field(min_length=1)],
     reply_to_comment_id: Annotated[int | None, Field(description="Inline review comment id (from github_pr_view) "
                                                                   "to reply in its thread instead.")] = None,
+    repo: REPO_ARG = None,
 ) -> str:
     """Comment on a PR or issue, or reply in an inline review thread."""
+    _use_repo(repo)
     if reply_to_comment_id:
         c = (await gh().request("POST", f"pulls/{number}/comments/{reply_to_comment_id}/replies", json={"body": body})).json()
     else:
@@ -1019,11 +1060,13 @@ async def github_pr_merge(
     title: Annotated[str | None, Field(description="Squash commit title; default: the PR title and number.")] = None,
     reviewed_comments: Annotated[bool, Field(description="Set true only after reading every review comment listed in a "
                                                           "previous refusal. Does not bypass any other check.")] = False,
+    repo: REPO_ARG = None,
 ) -> str:
     """Merge a PR, but only if it is open, not a draft, mergeable, still at `expected_head_sha`, every job of the
     latest workflow run on that commit succeeded, and no review thread is waiting for a reply (bot reviews arrive
     minutes after CI and are easy to miss). Merging is hard to undo, so this refuses on any doubt and says why;
     it never merges a PR with a pending, failed or missing CI run."""
+    _use_repo(repo)
     p = await gh().get(f"pulls/{number}")
     if p["state"] != "open":
         raise ToolError(f"#{number} is {p['state']}.")
@@ -1147,10 +1190,12 @@ async def github_pr_wait(
     timeout_seconds: Annotated[int, Field(description="Give up and report after this long.", ge=30, le=600)] = 540,
     review_grace_seconds: Annotated[int, Field(description="After CI finishes, how long to wait for the automated "
                                                             "review that follows it.", ge=0, le=600)] = 150,
+    repo: REPO_ARG = None,
 ) -> str:
     """Wait here, on the server, until CI on the PR's head finishes and the bot review that lands a couple of minutes
     later has had time to arrive, then report both: one call instead of polling github_ci_status. Returns early with
     what it has if the head moves or the timeout passes (call it again to keep waiting)."""
+    _use_repo(repo)
     start = time.monotonic()
     deadline = start + timeout_seconds
     head = (await gh().get(f"pulls/{number}"))["head"]["sha"]
@@ -1197,10 +1242,12 @@ async def github_pr_review(
     expected_head_sha: Annotated[str, Field(description="The head you reviewed; refused if the PR has moved since.",
                                             min_length=40, max_length=40)],
     comments: Annotated[list[dict], Field(description="Inline comments: [{path, line, body}] on the PR's new code.")] = [],
+    repo: REPO_ARG = None,
 ) -> str:
     """Record a cross-agent review on the PR itself, where every agent and machine can see it (the board doesn't
     leave this computer). The verdict is pinned to the head you reviewed: a later push needs a fresh review.
     github_merge_queue reads it; the PR's author agent can't review its own PR."""
+    _use_repo(repo)
     agent = _agent_of(reviewer)
     if not agent:
         raise ToolError("reviewer must be an agent session id starting with claude- or codex-.")
@@ -1323,10 +1370,12 @@ async def github_pr_diff(
     number: Annotated[int, Field(ge=1)],
     path: Annotated[str, Field(description="Only files whose path contains this text; empty = all (the list first).")] = "",
     max_chars: Annotated[int, Field(ge=1000, le=60000)] = 20000,
+    repo: REPO_ARG = None,
 ) -> str:
     """The PR's actual diff as GitHub has it at the head, file by file, so a reviewer on any worktree or machine reads
     the same source change without a checkout: a list of files with sizes when `path` is empty, the patches of the
     matching files otherwise. Binary and very large files come without a patch (GitHub omits it)."""
+    _use_repo(repo)
     p = await gh().get(f"pulls/{number}")
     files = await gh().paged(f"pulls/{number}/files", limit=300)
     head = p["head"]["sha"]

@@ -255,5 +255,39 @@ class Sync(unittest.IsolatedAsyncioTestCase):
             await server.github_pr_sync_main()
 
 
+class RepoArgument(unittest.IsolatedAsyncioTestCase):
+    """The PR tools take an optional `repo` so the agents can review and merge the server repository too, but only an allowed one."""
+
+    async def test_an_allowed_repo_routes_gh_to_it_for_that_call_only(self):
+        with patch.dict(os.environ, {"SKYRUNNER_GITHUB_REPO": "o/game", "SKYRUNNER_EXTRA_REPOS": "o/server"}):
+            server._gh = None
+            server._gh_other.clear()
+            self.assertEqual((server.gh().owner, server.gh().name), ("o", "game"))
+
+            async def inside():
+                server._use_repo("o/server")
+                return server.gh().name
+            self.assertEqual(await asyncio.create_task(inside()), "server")
+            self.assertEqual(server.gh().name, "game", "another call is back on the default repository")
+            server._gh = None
+            server._gh_other.clear()
+
+    async def test_other_repositories_and_malformed_names_are_refused(self):
+        with patch.dict(os.environ, {"SKYRUNNER_GITHUB_REPO": "o/game", "SKYRUNNER_EXTRA_REPOS": "o/server"}):
+            for bad in ("evil/repo", "o/server/extra", "o", "o/ser ver", "../x/y"):
+                with self.assertRaises(server.ToolError, msg=bad):
+                    server._use_repo(bad)
+            server._use_repo(None)
+            server._use_repo("")
+            server._use_repo("O/Game")  # case-insensitive match on the default repository
+
+    async def test_the_tools_that_only_talk_to_github_take_a_repo_argument_and_the_local_git_ones_do_not(self):
+        import inspect
+        for name in ("github_pr_view", "github_pr_comment", "github_pr_merge", "github_pr_wait", "github_pr_review", "github_ci_status", "github_pr_diff"):
+            self.assertIn("repo", inspect.signature(getattr(server, name)).parameters, name)
+        for name in ("github_merge_queue", "github_pr_sync_main", "github_pr_triage"):
+            self.assertNotIn("repo", inspect.signature(getattr(server, name)).parameters, name)
+
+
 if __name__ == "__main__":
     unittest.main()
