@@ -21,3 +21,18 @@ shell runs; `SKYRUNNER_MACHINE_LOCK=off` or another path. Windows: guards 2/2, c
 runtime 17/17 with one POSIX skip (2 new), wheel built. Linux is left to CI. Next: independent review, then
 bump the game's pin in a separate game PR. `codex/board-wake` (unpushed) has its own `board_path` in
 `board_channel.py`; it should call `collaboration.board_path` after this merges.
+
+## Compact collaboration inbox (Codex, 11 October 2026)
+
+Branch `codex/compact-collaboration-inbox`, base main `3411693`. Adds the read-only
+`skyrunner_collaboration_inbox` MCP tool: addressed/shared new notes, every active claim, no task
+history, explicit `has_more` and a saved cursor. Full note text is preserved; a SQLite read snapshot
+prevents a concurrent insert from being skipped while advancing past unrelated notes. Existing tools
+and full-history reads stay unchanged. Tests cover filtering/pagination, exact-page boundaries,
+expired/released claims, long Unicode text, validation and two independent stdio clients.
+Windows validation: collaboration 15/15, guards 2/2, runtime 18 tests (one POSIX-only skip),
+GitHub collaboration 9/9; final stdio extension and wheel validation recorded in delivery note.
+Next: Claude independent review, Windows/Linux CI, reviewed server release and separate game pin
+update. Current running clients do not expose this new tool until installed/reconnected.
+Owner ruling in game board note 88: both agents lose points for insufficient collaboration tooling;
+score entries belong to the game score log, not this server repository. No merge performed.

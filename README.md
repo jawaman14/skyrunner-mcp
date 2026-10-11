@@ -34,6 +34,9 @@ dispatch without authentication. GitHub tools operate on the **game checkout's o
 
 - Collaboration: `skyrunner_collaboration_start`, `read`, `claim`, `update`, `note` (full names retain the
   `skyrunner_collaboration_` prefix). Start with `start`, verify target/revision and read the shared inbox.
+- Compact polling: `skyrunner_collaboration_inbox(recipient, after, limit=10)` returns new addressed/shared
+  notes and all active claims, without completed-task history. Save `next_cursor`; drain pages while
+  `has_more` is true. Notes are never clipped. Use `read` when you need historical tasks.
 - Game: filtered tests, import, smoke, screenshots, balance, scripts, command/switch introspection and
   project-status checks. Long jobs return IDs; poll their owning client instead of restarting them.
 - Jobs: status/logs/cancellation. Kernel locks serialize Godot work per checkout across MCP processes, and a
