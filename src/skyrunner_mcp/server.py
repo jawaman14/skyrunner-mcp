@@ -1332,19 +1332,23 @@ async def github_pr_states(
     limit: Annotated[int, Field(ge=1, le=60)] = 40,
     merged_limit: Annotated[int, Field(ge=0, le=30)] = 10,
 ) -> str:
-    """The open PRs as JSON for a program to read (the alert feed): per PR its number, title, FULL head sha, branch, draft flag, whether it merges
-    cleanly, CI state on the head with the failing jobs, the marked agent reviews (agent, verdict, head), and the ids of unanswered review
+    """The open PRs as JSON for a program to read (the alert feed): per PR its number, title, FULL head sha, branch, draft flag, whether it
+    conflicts with the default branch and how far behind it is, CI state on the head with the failing jobs, the marked agent reviews (agent, verdict, head), and the ids of unanswered review
     threads; plus the numbers of recently merged PRs. The same facts as github_merge_queue, without the prose."""
     pulls = await gh().paged("pulls", limit=limit, state="open")
+    await asyncio.to_thread(_fetch_origin)
+    default = (await gh().get(gh().repo))["default_branch"]
     rows = []
     for p in pulls:
         head = p["head"]["sha"]
         n = p["number"]
+        same_repo = p["head"]["repo"] and p["head"]["repo"]["full_name"] == f"{gh().owner}/{gh().name}"
+        merge = await asyncio.to_thread(_merge_state, default, p["head"]["ref"]) if same_repo else {"state": "fork"}
         ci = await _head_ci(head)
         reviews = _marked_reviews(await gh().paged(f"pulls/{n}/reviews", limit=100))
         waiting = await _waiting_comments(n)
         rows.append({"number": n, "title": p["title"], "head": head, "branch": p["head"]["ref"], "draft": bool(p["draft"]),
-                     "mergeable": p.get("mergeable"), "ci": ci["state"], "ci_bad": ci["bad"],
+                     "conflicts": merge.get("clean") is False, "behind": merge.get("behind"), "ci": ci["state"], "ci_bad": ci["bad"],
                      "reviews": [{"agent": r["agent"], "verdict": r["verdict"], "head": r["head"]} for r in reviews],
                      "waiting": [{"id": c["id"], "path": c.get("path"), "line": c.get("line") or c.get("original_line"),
                                   "body": " ".join(str(c.get("body", "")).split())[:600]} for c in waiting[:20]]})
