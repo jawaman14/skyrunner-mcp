@@ -257,6 +257,11 @@ class States(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((pr["number"], pr["head"], pr["branch"], pr["ci"]), (7, HEAD, "claude/feature", "success"))
         self.assertEqual(pr["reviews"], [{"agent": "codex", "verdict": "approve", "head": HEAD}])
         self.assertEqual((pr["conflicts"], pr["behind"]), (True, 3))
+        self.assertEqual(pr["merge_state"], "known")
+        with patch.object(server, "gh", return_value=fake), patch.object(server, "_fetch_origin", lambda: None), \
+                patch.object(server, "_merge_state", lambda base, ref: {"state": "branch not fetched"}):
+            unknown = json.loads(await server.github_pr_states())["open"][0]
+        self.assertEqual((unknown["conflicts"], unknown["merge_state"]), (None, "branch not fetched"))
         self.assertEqual([w["id"] for w in pr["waiting"]], [1])
 
     async def test_the_tool_is_registered_read_only(self):
