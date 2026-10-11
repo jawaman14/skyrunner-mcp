@@ -1464,13 +1464,21 @@ async def github_issue_write(
     body: Annotated[str, Field(description="New issue body, or the comment for an existing issue.")] = "",
     labels: Annotated[list[str], Field(description="Labels for a new issue.")] = [],
     close: Annotated[Literal["", "completed", "not_planned"], Field(description="Close an existing issue with this reason.")] = "",
+    replace_body: Annotated[bool, Field(description="With a number: replace the issue's own body with `body` (to tick a checklist) instead of adding a comment.")] = False,
 ) -> str:
-    """Create an issue, or comment on and optionally close an existing one."""
+    """Create an issue, or comment on, edit the body of, and optionally close an existing one."""
     if number is None:
         if not title:
             raise ToolError("Give a title to create an issue, or a number to comment on one.")
         i = (await gh().request("POST", "issues", json={"title": title, "body": body, "labels": labels})).json()
         return f"Created issue #{i['number']}: {i['html_url']}"
+    if replace_body:
+        if not body:
+            raise ToolError("replace_body needs the new body text; refusing to blank an issue.")
+        await gh().request("PATCH", f"issues/{number}", json={"body": body})
+        if close:
+            await gh().request("PATCH", f"issues/{number}", json={"state": "closed", "state_reason": close})
+        return f"Issue #{number}: body replaced{' and closed (' + close + ')' if close else ''}."
     if body:
         await gh().request("POST", f"issues/{number}/comments", json={"body": body})
     if close:

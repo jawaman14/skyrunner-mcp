@@ -255,6 +255,24 @@ class Sync(unittest.IsolatedAsyncioTestCase):
             await server.github_pr_sync_main()
 
 
+class IssueBody(unittest.IsolatedAsyncioTestCase):
+    async def test_replace_body_patches_the_issue_and_a_plain_write_still_comments(self):
+        calls = []
+
+        class Rec:
+            async def request(self, method, path, **kw):
+                calls.append((method, path, kw.get("json")))
+                return types.SimpleNamespace(json=lambda: {})
+        with patch.object(server, "gh", return_value=Rec()):
+            out = await server.github_issue_write(number=5, body="- [x] done", replace_body=True)
+            self.assertIn("body replaced", out)
+            self.assertEqual(calls[-1], ("PATCH", "issues/5", {"body": "- [x] done"}))
+            await server.github_issue_write(number=5, body="a comment")
+            self.assertEqual(calls[-1][:2], ("POST", "issues/5/comments"))
+            with self.assertRaises(server.ToolError):
+                await server.github_issue_write(number=5, body="", replace_body=True)
+
+
 class RepoArgument(unittest.IsolatedAsyncioTestCase):
     """The PR tools take an optional `repo` so the agents can review and merge the server repository too, but only an allowed one."""
 
