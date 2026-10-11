@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import contextvars
+import functools
 import hashlib
 import json
 import logging
@@ -794,16 +795,30 @@ def _allowed_repos() -> set[str]:
     return allowed
 
 
-def _use_repo(repo: str | None) -> None:
-    """Point this tool call's `gh()` at `repo` (owner/name) instead of the default repository. Refuses a repository that is not allowed."""
+def _use_repo(repo: str | None) -> str | None:
+    """Validate `repo` (owner/name) for a tool call: returns it, or None for the default repository. Refuses one that is not allowed."""
     if not repo:
-        return
+        return None
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
         raise ToolError(f"repo must be owner/name, not {repo!r}.")
     if repo.lower() not in _allowed_repos():
         raise ToolError(f"{repo} is not an allowed repository (allowed: {', '.join(sorted(_allowed_repos()))}; "
                         f"set SKYRUNNER_EXTRA_REPOS to add one).")
-    _repo_var.set(repo)
+    return repo
+
+
+def _scoped(fn):
+    """Run a tool with `gh()` pointed at its `repo` argument for that call only, and restore the previous repository afterwards, so a later call that names
+    no repo can never inherit this one (the reset is in a finally)."""
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        repo = _use_repo(kwargs.get("repo"))
+        token = _repo_var.set(repo or "")
+        try:
+            return await fn(*args, **kwargs)
+        finally:
+            _repo_var.reset(token)
+    return wrapper
 
 
 def gh() -> GitHub:
@@ -902,6 +917,7 @@ async def _ref_for(ref: str) -> tuple[str, str]:
 
 
 @mcp.tool(name="github_ci_status", annotations=GH_READ)
+@_scoped
 async def github_ci_status(
     ref: Annotated[str, Field(description="PR number (e.g. '293'), branch or commit sha; empty = current branch.")] = "",
     runs: Annotated[int, Field(description="How many recent workflow runs to list.", ge=1, le=20)] = 3,
@@ -909,7 +925,6 @@ async def github_ci_status(
 ) -> str:
     """GitHub Actions runs for a PR/branch/commit and the per-job results of the latest one, with the job ids that
     github_ci_logs takes. The workflow is .github/workflows/skyrunner-beta.yml (test lanes, exports, smoke)."""
-    _use_repo(repo)
     kind, value = await _ref_for(ref)
     params = {"head_sha": value} if kind == "sha" else {"branch": value}
     data = await gh().get("actions/runs", per_page=runs, **params)
@@ -929,9 +944,11 @@ async def github_ci_status(
 
 
 @mcp.tool(name="github_ci_logs", annotations=GH_READ)
+@_scoped
 async def github_ci_logs(
     job_id: Annotated[int, Field(description="Job id from github_ci_status.")],
     tail_lines: Annotated[int, Field(ge=0, le=500)] = 60,
+    repo: REPO_ARG = None,
 ) -> str:
     """A CI job's log reduced to what matters: FAIL / SCRIPT ERROR / Parse Error / GitHub ##[error] lines (with
     their `at:` locations) plus the last lines. Timestamps are stripped."""
@@ -950,9 +967,9 @@ async def github_ci_logs(
 
 
 @mcp.tool(name="github_pr_view", annotations=GH_READ)
+@_scoped
 async def github_pr_view(number: Annotated[int, Field(ge=1)], repo: REPO_ARG = None) -> str:
     """A PR's description, mergeability, changed files, reviews and inline review comments (unresolved context)."""
-    _use_repo(repo)
     p = await gh().get(f"pulls/{number}")
     files = await gh().paged(f"pulls/{number}/files", limit=300)
     reviews = await gh().paged(f"pulls/{number}/reviews", limit=100)
@@ -1002,6 +1019,7 @@ async def github_pr_create(
 
 
 @mcp.tool(name="github_pr_comment", annotations=GH_WRITE)
+@_scoped
 async def github_pr_comment(
     number: Annotated[int, Field(description="PR or issue number.", ge=1)],
     body: Annotated[str, Field(min_length=1)],
@@ -1010,7 +1028,6 @@ async def github_pr_comment(
     repo: REPO_ARG = None,
 ) -> str:
     """Comment on a PR or issue, or reply in an inline review thread."""
-    _use_repo(repo)
     if reply_to_comment_id:
         c = (await gh().request("POST", f"pulls/{number}/comments/{reply_to_comment_id}/replies", json={"body": body})).json()
     else:
@@ -1051,6 +1068,7 @@ async def _mark_ready(number: int) -> None:
 
 
 @mcp.tool(name="github_pr_merge", annotations=GH_DESTRUCTIVE)
+@_scoped
 async def github_pr_merge(
     number: Annotated[int, Field(ge=1)],
     expected_head_sha: Annotated[str, Field(description="The full head commit you checked CI on (github_ci_status). "
@@ -1066,7 +1084,6 @@ async def github_pr_merge(
     latest workflow run on that commit succeeded, and no review thread is waiting for a reply (bot reviews arrive
     minutes after CI and are easy to miss). Merging is hard to undo, so this refuses on any doubt and says why;
     it never merges a PR with a pending, failed or missing CI run."""
-    _use_repo(repo)
     p = await gh().get(f"pulls/{number}")
     if p["state"] != "open":
         raise ToolError(f"#{number} is {p['state']}.")
@@ -1185,6 +1202,7 @@ def _queue_blockers(author: str, draft: bool, ci_state: str, reviews: list[dict]
 
 
 @mcp.tool(name="github_pr_wait", annotations=GH_READ)
+@_scoped
 async def github_pr_wait(
     number: Annotated[int, Field(ge=1)],
     timeout_seconds: Annotated[int, Field(description="Give up and report after this long.", ge=30, le=600)] = 540,
@@ -1195,7 +1213,6 @@ async def github_pr_wait(
     """Wait here, on the server, until CI on the PR's head finishes and the bot review that lands a couple of minutes
     later has had time to arrive, then report both: one call instead of polling github_ci_status. Returns early with
     what it has if the head moves or the timeout passes (call it again to keep waiting)."""
-    _use_repo(repo)
     start = time.monotonic()
     deadline = start + timeout_seconds
     head = (await gh().get(f"pulls/{number}"))["head"]["sha"]
@@ -1233,6 +1250,7 @@ async def github_pr_wait(
 
 
 @mcp.tool(name="github_pr_review", annotations=GH_WRITE)
+@_scoped
 async def github_pr_review(
     number: Annotated[int, Field(ge=1)],
     reviewer: Annotated[str, Field(description="Your session owner id, e.g. codex-<thread id> or claude-<session id>.")],
@@ -1247,7 +1265,6 @@ async def github_pr_review(
     """Record a cross-agent review on the PR itself, where every agent and machine can see it (the board doesn't
     leave this computer). The verdict is pinned to the head you reviewed: a later push needs a fresh review.
     github_merge_queue reads it; the PR's author agent can't review its own PR."""
-    _use_repo(repo)
     agent = _agent_of(reviewer)
     if not agent:
         raise ToolError("reviewer must be an agent session id starting with claude- or codex-.")
@@ -1366,6 +1383,7 @@ async def skyrunner_merge_resolution(
 
 
 @mcp.tool(name="github_pr_diff", annotations=GH_READ)
+@_scoped
 async def github_pr_diff(
     number: Annotated[int, Field(ge=1)],
     path: Annotated[str, Field(description="Only files whose path contains this text; empty = all (the list first).")] = "",
@@ -1375,7 +1393,6 @@ async def github_pr_diff(
     """The PR's actual diff as GitHub has it at the head, file by file, so a reviewer on any worktree or machine reads
     the same source change without a checkout: a list of files with sizes when `path` is empty, the patches of the
     matching files otherwise. Binary and very large files come without a patch (GitHub omits it)."""
-    _use_repo(repo)
     p = await gh().get(f"pulls/{number}")
     files = await gh().paged(f"pulls/{number}/files", limit=300)
     head = p["head"]["sha"]
