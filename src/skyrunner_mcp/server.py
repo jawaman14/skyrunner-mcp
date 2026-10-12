@@ -1323,6 +1323,106 @@ async def github_merge_queue(
     return f"{ready} of {len(entries)} ready to merge into {default}.\n\n" + "\n".join(rows)
 
 
+def _is_test_path(path: str) -> bool:
+    base = path.rsplit("/", 1)[-1]
+    named = base.startswith("test_") and base.endswith((".py", ".gd"))
+    return (path.startswith("tests/") or named or base.endswith("_test.py")) and not path.endswith((".uid", ".json"))
+
+
+@mcp.tool(name="github_review_packet", annotations=GH_READ)
+async def github_review_packet(number: Annotated[int, Field(ge=1)], diff_lines: Annotated[int, Field(ge=0, le=5000)] = 0) -> str:
+    """One bounded read of a pull request at its CURRENT head, for a reviewer: the full head sha, files with sizes, the tests that sit
+    beside changed files by name (a heuristic, not dependency analysis), CI with the failing jobs named, every agent review marked CURRENT or
+    STALE against the head, the review bodies of current reviews, the unanswered review threads, and optionally the first `diff_lines` lines of
+    the diff. It replaces five GitHub calls and works where the shell has no network, because the server makes the calls."""
+    p = await gh().get(f"pulls/{number}")
+    head = p["head"]["sha"]
+    files = await gh().paged(f"pulls/{number}/files", limit=300)
+    raw_reviews = await gh().paged(f"pulls/{number}/reviews", limit=100)
+    marked = _marked_reviews(raw_reviews)
+    waiting = await _waiting_comments(number)
+    ci = await _head_ci(head)
+    paths = {f["filename"] for f in files}
+    removed = {f["filename"] for f in files if f["status"] == "removed"}
+    tests_by_name = {}
+    for f in files:
+        name = f["filename"]
+        stem = name.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        if name.startswith("tests/") or not name.endswith(".gd"):
+            continue
+        cand = f"tests/test_{stem}.gd"
+        if cand not in removed and (cand in paths or (ROOT / cand).is_file()):
+            tests_by_name[name] = cand
+    out = [f"PR #{number} {'[draft] ' if p.get('draft') else ''}{p['title']} | {p['user']['login']} {p['head']['ref']} -> {p['base']['ref']}",
+           f"head {head}",
+           f"CI on this head: {ci['state']}" + (f" ({ci['jobs']} jobs)" if ci["jobs"] else "") + (f"; failing: {'; '.join(ci['bad'])}" if ci["bad"] else "")]
+    if not marked:
+        out.append("Agent reviews: none")
+    for r in marked:
+        out.append(f"Agent review by {r['agent']}: {r['verdict']} at {r['head'][:7]} ({'CURRENT' if r['head'] == head else 'STALE: older head'})")
+    for r in raw_reviews:
+        m = _REVIEW_RE.search(r.get("body") or "")
+        if m and m.group(3) == head:
+            body = " ".join((_REVIEW_RE.sub("", r.get("body") or "")).split())[:300]
+            out.append(f"  review text ({m.group(1)}): {body}")
+    out.append(f"Unanswered review threads: {len(waiting)}")
+    for c in waiting[:8]:
+        out.append(f"  {c.get('path')}:{c.get('line') or c.get('original_line')} {c['user']['login']}: {' '.join(str(c.get('body', '')).split())[:200]}")
+    total_add = sum(f["additions"] for f in files)
+    total_del = sum(f["deletions"] for f in files)
+    out.append(f"Files ({len(files)}, +{total_add}/-{total_del}):")
+    for f in files[:30]:
+        tail = f"   tests by name: {tests_by_name[f['filename']]}" if f["filename"] in tests_by_name else ""
+        out.append(f"  +{f['additions']}/-{f['deletions']} {f['filename']}{tail}")
+    if len(files) > 30:
+        out.append(f"  ... {len(files) - 30} more files")
+    changed_tests = sorted(n for n in paths - removed if _is_test_path(n))
+    out.append(f"The PR changes {len(changed_tests)} test file(s)" + (": " + ", ".join(changed_tests[:6]) if changed_tests else "") +
+               ". (Tests by name are a heuristic, not a dependency analysis.)")
+    if diff_lines:
+        lines = []
+        for f in files:
+            lines += [f"### {f['filename']} ({f['status']})"] + (f.get("patch") or "(no patch: binary or too large)").splitlines()
+        out.append(f"Diff (first {min(diff_lines, len(lines))} of {len(lines)} lines):")
+        out += lines[:diff_lines]
+    now = (await gh().get(f"pulls/{number}"))["head"]["sha"]
+    if now != head:
+        out.append(f"WARNING: the head moved while this was read (now {now[:8]}); run it again.")
+    return "\n".join(out)
+
+
+@mcp.tool(name="github_pr_states", annotations=GH_READ)
+async def github_pr_states(
+    limit: Annotated[int, Field(ge=1, le=60)] = 40,
+    merged_limit: Annotated[int, Field(ge=0, le=30)] = 10,
+) -> str:
+    """The open PRs as JSON for a program to read (the alert feed): per PR its number, title, FULL head sha, branch, draft flag, whether it
+    conflicts with the default branch (null with a merge_state reason when unknown, e.g. a fork or an unfetched branch) and how far behind it is, CI state on the head with the failing jobs, the marked agent reviews (agent, verdict, head), and the ids of unanswered review
+    threads; plus the numbers of recently merged PRs. The same facts as github_merge_queue, without the prose."""
+    pulls = await gh().paged("pulls", limit=limit, state="open")
+    await asyncio.to_thread(_fetch_origin)
+    default = (await gh().get(gh().repo))["default_branch"]
+    rows = []
+    for p in pulls:
+        head = p["head"]["sha"]
+        n = p["number"]
+        same_repo = p["head"]["repo"] and p["head"]["repo"]["full_name"] == f"{gh().owner}/{gh().name}"
+        merge = await asyncio.to_thread(_merge_state, default, p["head"]["ref"]) if same_repo else {"state": "fork"}
+        ci = await _head_ci(head)
+        reviews = _marked_reviews(await gh().paged(f"pulls/{n}/reviews", limit=100))
+        waiting = await _waiting_comments(n)
+        rows.append({"number": n, "title": p["title"], "head": head, "branch": p["head"]["ref"], "draft": bool(p["draft"]),
+                     "conflicts": (not merge["clean"]) if "clean" in merge else None, "behind": merge.get("behind"), "merge_state": "known" if "clean" in merge else merge.get("state", "unknown"), "ci": ci["state"], "ci_bad": ci["bad"],
+                     "reviews": [{"agent": r["agent"], "verdict": r["verdict"], "head": r["head"]} for r in reviews],
+                     "waiting": [{"id": c["id"], "path": c.get("path"), "line": c.get("line") or c.get("original_line"),
+                                  "body": " ".join(str(c.get("body", "")).split())[:600]} for c in waiting[:20]]})
+    merged = []
+    if merged_limit:
+        done = await gh().paged("pulls", limit=merged_limit, state="closed", sort="updated", direction="desc")
+        merged = [p["number"] for p in done if p.get("merged_at")][:merged_limit]
+    return json.dumps({"open": rows, "merged": merged})
+
+
 @mcp.tool(name="github_pr_sync_main", annotations=LOCAL_WRITE)
 async def github_pr_sync_main(
     push: Annotated[bool, Field(description="Push the merge if it was clean. Default: leave it for your tests first.")] = False,

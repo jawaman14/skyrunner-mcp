@@ -1,6 +1,7 @@
 """The collaboration GitHub tools: waiting on CI, cross-agent reviews, the merge queue, syncing with the default
 branch and reading a merge's resolution. GitHub is faked; git runs on throwaway repositories. No network."""
 import asyncio
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -180,6 +181,92 @@ class Diff(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("big.png", one)
             with self.assertRaises(server.ToolError):
                 await server.github_pr_diff(7, path="nothing-here")
+
+
+class Packet(unittest.IsolatedAsyncioTestCase):
+    """github_review_packet: one bounded read of a PR at its current head, from the server, so a turn with no network can review."""
+
+    def fake(self, head=HEAD, moves_to=None):
+        files = [{"filename": "scripts/sim/people.gd", "status": "modified", "additions": 10, "deletions": 2, "patch": "@@ -1 +1 @@\n-a\n+b"},
+                 {"filename": "tests/test_people.gd", "status": "added", "additions": 5, "deletions": 0, "patch": "+t"},
+                 {"filename": "tools/collab/test_collab_tools.py", "status": "modified", "additions": 3, "deletions": 0, "patch": "+x"}]
+        comments = [{"id": 1, "path": "a.gd", "line": 3, "user": {"login": "bot"}, "body": "unanswered finding"},
+                    {"id": 2, "path": "b.gd", "line": 4, "user": {"login": "bot"}, "body": "answered finding"},
+                    {"id": 3, "in_reply_to_id": 2, "user": {"login": "me"}, "body": "done"}]
+        reviews = [review("codex", "approve", OLD), review("codex", "changes", head)]
+        seen = {"gets": 0}
+
+        class Fake(FakeGitHub):
+            async def get(self, path, **params):
+                if path == "pulls/7":
+                    seen["gets"] += 1
+                    sha = moves_to if (moves_to and seen["gets"] > 1) else head
+                    return {"number": 7, "head": {"sha": sha, "ref": "claude/feature", "repo": {"full_name": "o/r"}}, "base": {"ref": "main"},
+                            "draft": False, "title": "Fix people", "user": {"login": "owner"}, "created_at": "2026-10-11T00:00:00Z"}
+                return await super().get(path, **params)
+
+            async def paged(self, path, **kwargs):
+                if path == "pulls/7/files":
+                    return files
+                return await super().paged(path, **kwargs)
+        return Fake(reviews=reviews, comments=comments)
+
+    async def test_the_packet_has_the_full_head_ci_marked_reviews_threads_files_and_tests(self):
+        with patch.object(server, "gh", return_value=self.fake()):
+            text = await server.github_review_packet(7)
+        self.assertIn("head " + HEAD, text, "the full 40-character head")
+        self.assertIn("CI on this head: success", text)
+        self.assertIn("Agent review by codex: approve at " + OLD[:7] + " (STALE: older head)", text)
+        self.assertIn("Agent review by codex: changes at " + HEAD[:7] + " (CURRENT)", text)
+        self.assertIn("Unanswered review threads: 1", text)
+        self.assertIn("a.gd:3", text)
+        self.assertNotIn("b.gd:4", text, "an answered thread is not listed")
+        self.assertIn("+10/-2 scripts/sim/people.gd   tests by name: tests/test_people.gd", text)
+        self.assertIn("The PR changes 2 test file(s)", text, "tests outside tests/ count too")
+        self.assertLess(len(text), 3000, "bounded")
+
+    async def test_the_diff_is_capped_and_a_head_that_moves_is_flagged(self):
+        with patch.object(server, "gh", return_value=self.fake(moves_to="d" * 40)):
+            text = await server.github_review_packet(7, diff_lines=4)
+        self.assertIn("Diff (first 4 of", text)
+        self.assertIn("WARNING: the head moved while this was read", text)
+
+    async def test_the_tool_is_registered_and_read_only(self):
+        tools = {t.name: t for t in await server.mcp.list_tools()}
+        self.assertIn("github_review_packet", tools)
+        self.assertTrue(tools["github_review_packet"].annotations.read_only_hint)
+
+
+class States(unittest.IsolatedAsyncioTestCase):
+    async def test_the_states_are_json_with_the_full_head_marked_reviews_waiting_threads_and_merged_numbers(self):
+        comments = [{"id": 1, "path": "a.gd", "line": 3, "user": {"login": "bot"}, "body": "unanswered"},
+                    {"id": 2, "path": "b.gd", "line": 4, "user": {"login": "bot"}, "body": "answered"}, {"id": 3, "in_reply_to_id": 2, "user": {"login": "me"}, "body": "ok"}]
+
+        class Fake(FakeGitHub):
+            async def paged(self, path, **kwargs):
+                if path == "pulls" and kwargs.get("state") == "closed":
+                    return [{"number": 5, "merged_at": "2026-10-11T00:00:00Z"}, {"number": 6, "merged_at": None}]
+                return await super().paged(path, **kwargs)
+
+        fake = Fake(reviews=[review("codex", "approve", HEAD)], comments=comments)
+        with patch.object(server, "gh", return_value=fake), patch.object(server, "_fetch_origin", lambda: None), \
+                patch.object(server, "_merge_state", lambda base, ref: {"clean": False, "behind": 3, "ahead": 1}):
+            data = json.loads(await server.github_pr_states())
+        self.assertEqual(data["merged"], [5], "closed without a merge is not merged")
+        pr = data["open"][0]
+        self.assertEqual((pr["number"], pr["head"], pr["branch"], pr["ci"]), (7, HEAD, "claude/feature", "success"))
+        self.assertEqual(pr["reviews"], [{"agent": "codex", "verdict": "approve", "head": HEAD}])
+        self.assertEqual((pr["conflicts"], pr["behind"]), (True, 3))
+        self.assertEqual(pr["merge_state"], "known")
+        with patch.object(server, "gh", return_value=fake), patch.object(server, "_fetch_origin", lambda: None), \
+                patch.object(server, "_merge_state", lambda base, ref: {"state": "branch not fetched"}):
+            unknown = json.loads(await server.github_pr_states())["open"][0]
+        self.assertEqual((unknown["conflicts"], unknown["merge_state"]), (None, "branch not fetched"))
+        self.assertEqual([w["id"] for w in pr["waiting"]], [1])
+
+    async def test_the_tool_is_registered_read_only(self):
+        tools = {t.name: t for t in await server.mcp.list_tools()}
+        self.assertTrue(tools["github_pr_states"].annotations.read_only_hint)
 
 
 class Sync(unittest.IsolatedAsyncioTestCase):
