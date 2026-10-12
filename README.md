@@ -50,6 +50,11 @@ dispatch without authentication. GitHub tools operate on the **game checkout's o
   its CI, the other agent's review and a READY / blocked verdict), `github_pr_diff` (the diff, file by file),
   `github_pr_sync_main` and `skyrunner_merge_resolution` (merge the default branch in; read only how conflicts
   were resolved).
+  `github_review_packet` (one bounded read of a PR at its current head for a reviewer: the full head sha, CI with the failing jobs,
+  agent reviews marked CURRENT or STALE, unanswered threads, files with the tests that sit beside them, an optional capped diff; it works
+  where a shell has no network, because the server makes the calls).
+  `github_pr_states` (the open PRs as JSON for a program: full head sha, branch, draft, CI with failing jobs, marked agent reviews, unanswered
+  review thread ids, and recently merged numbers; the alert feed reads it instead of calling `gh`).
 
 - Local model (LM Studio, optional): `local_llm_status`, `local_llm_digest` (a log or a PR diff), `local_llm_thread_summaries`
   (what each unanswered review comment asks and what to check, never a verdict or a reply) and `local_llm_triage` (open PRs: the

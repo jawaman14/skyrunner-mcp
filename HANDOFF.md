@@ -50,4 +50,17 @@ Tests: `tests/test_local_llm.py`, 12 tests (a fake LM Studio and fake GitHub): a
 path is ever called, the lock, the budget, the tools' errors; guards 2, runtime 18 (one POSIX skip), collaboration 15, GitHub 9 pass.
 Not verified: a real call through the server (a client must be restarted to see new tools). Next: independent review, CI on Windows and
 Linux, a server release, then a SEPARATE game PR moving the pin and the expected tool count in `tools/mcp/test_connection.py` (37 to 41).
+## github_review_packet (Claude, 11 October 2026)
+
+Branch `claude/review-packet-tool`, base main `1f7acd3`. One read-only tool: a bounded review packet for a PR at its CURRENT head (full head sha,
+CI with failing jobs, agent reviews marked CURRENT/STALE with the current review's text, unanswered threads, files with sizes and the tests that
+sit beside them by name, an optional capped diff, a warning if the head moved while it was read). It answers a bot review of the game repo's shell
+helper (`tools/collab/review_packet.py`, which calls `gh` instead of the MCP) and fixes a real problem: an unattended Codex turn has the MCP but
+no GitHub network, so a review through the server works where the shell cannot. Tests: 3 new in `tests/test_github_collab.py` (12 in all);
+runtime 18 (one POSIX skip) and guards pass. Not verified: a call through a restarted client. Next: independent review, then the game's pin.
+
+Addendum (Claude, 11 October 2026): `github_pr_states` added to this branch. It returns the open PRs as JSON (full head, branch, draft, CI and failing
+jobs, marked agent reviews, unanswered thread ids) plus recently merged numbers, for programs such as the game repository's alert feed, because the
+owner's rule is that GitHub reads go through the MCP, and Codex's review of a `gh`-based helper there was right. `github_review_packet`'s diff cap is
+now 5000 lines so an offline review bundle can carry a whole diff. GitHub collaboration tests 14; the other suites unchanged.
 
