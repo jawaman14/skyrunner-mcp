@@ -39,6 +39,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field
 from .collaboration import Board, MachineLock, ProjectLock, board_path, machine_lock_path
+from . import clock as clock_mod
 from . import local_llm as _llm
 
 logging.getLogger("httpx").setLevel(logging.WARNING)  # one INFO line per request otherwise
@@ -167,6 +168,67 @@ async def skyrunner_collaboration_note(author: str, text: str,
     except ValueError as e:
         raise ToolError(str(e)) from e
     return json.dumps({"note_id": note})
+
+
+def _clock() -> clock_mod.Clock:
+    return clock_mod.Clock(_board().path)
+
+
+@mcp.tool(name="clock_now", annotations=READ_ONLY)
+async def clock_now(timezone: str = "local") -> str:
+    """The current date and time (local zone by default; or UTC, or an IANA name such as Australia/Sydney). Use it instead of guessing how long "until 4:11 PM" is."""
+    try:
+        return json.dumps(clock_mod.now(timezone))
+    except ValueError as e:
+        raise ToolError(str(e)) from e
+
+
+@mcp.tool(name="clock_timer_set", annotations=LOCAL_RUN)
+async def clock_timer_set(owner: Literal["claude", "codex", "owner"], label: str, at: str = "", in_minutes: int = 0,
+                          agent: Literal["claude", "codex", "owner", ""] = "", timezone: str = "local") -> str:
+    """Remember a time to come back at: `at` is HH:MM (the next time the clock reads it), h:MM am/pm or an ISO date-time; or `in_minutes` from now.
+
+    Set `agent` when someone is away until then ("codex is out of usage until 16:11"): the timer is then an availability note. Nothing wakes anyone: ask `clock_timers`.
+    """
+    try:
+        due = clock_mod.parse_when(at, in_minutes, timezone)
+        timer = _clock().set(owner, label, due, agent)
+    except ValueError as e:
+        raise ToolError(str(e)) from e
+    return json.dumps({"timer_id": timer, "due": clock_mod.now(timezone, due), "in_seconds": int(due - time.time())})
+
+
+@mcp.tool(name="clock_timers", annotations=READ_ONLY)
+async def clock_timers(include_cleared: bool = False, timezone: str = "local") -> str:
+    """The time now and every timer: pending (seconds left) or due. Check it when you wake or before you report that you are waiting."""
+    try:
+        return json.dumps({"now": clock_mod.now(timezone), "timers": _clock().rows(include_cleared, tz_name=timezone)})
+    except ValueError as e:
+        raise ToolError(str(e)) from e
+
+
+@mcp.tool(name="clock_timer_clear", annotations=LOCAL_RUN)
+async def clock_timer_clear(timer_id: int) -> str:
+    """Clear a timer that is done or no longer needed (the timer stays in the history)."""
+    try:
+        _clock().clear(timer_id)
+    except ValueError as e:
+        raise ToolError(str(e)) from e
+    return json.dumps({"cleared": timer_id})
+
+
+@mcp.tool(name="clock_wait", annotations=READ_ONLY)
+async def clock_wait(timer_id: int, max_seconds: int = clock_mod.MAX_WAIT_S) -> str:
+    """Wait for a timer to come due, for at most max_seconds (up to 540); returns at once if it is already due. Says how long is left if it is still pending."""
+    try:
+        left = _clock().remaining(timer_id)
+    except ValueError as e:
+        raise ToolError(str(e)) from e
+    wait = min(left, max(0, min(int(max_seconds), clock_mod.MAX_WAIT_S)))
+    if wait > 0:
+        await asyncio.sleep(wait)
+    left = _clock().remaining(timer_id)
+    return json.dumps({"timer_id": timer_id, "due": left <= 0, "seconds_left": int(left)})
 
 
 @mcp.tool(name="skyrunner_collaboration_start", annotations=READ_ONLY)

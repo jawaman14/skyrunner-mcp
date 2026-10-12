@@ -56,6 +56,9 @@ dispatch without authentication. GitHub tools operate on the **game checkout's o
   `github_pr_states` (the open PRs as JSON for a program: full head sha, branch, draft, CI with failing jobs, marked agent reviews, unanswered
   review thread ids, and recently merged numbers; the alert feed reads it instead of calling `gh`).
 
+- Clock (no network): `clock_now` (the time and zone; use it instead of guessing how long "until 4:11 PM" is), `clock_timer_set` (HH:MM, h:MM am/pm, an ISO date-time or `in_minutes`;
+  `agent=` marks someone as away until then), `clock_timers` (what is pending or due), `clock_timer_clear`, `clock_wait` (up to 540 s on one timer). Timers live in the
+  board's database. Nothing wakes anyone; ask the clock when you wake.
 - Local model (LM Studio, optional): `local_llm_status`, `local_llm_digest` (a log or a PR diff), `local_llm_thread_summaries`
   (what each unanswered review comment asks and what to check, never a verdict or a reply) and `local_llm_triage` (open PRs: the
   review tier from the file paths, no model, plus a one-line summary). Set `SKYRUNNER_LOCAL_LLM` to the server address. The owner's
