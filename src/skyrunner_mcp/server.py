@@ -1056,24 +1056,35 @@ async def github_pr_view(number: Annotated[int, Field(ge=1)], repo: REPO_ARG = N
 
 
 @mcp.tool(name="github_pr_create", annotations=GH_WRITE)
+@_scoped
 async def github_pr_create(
     title: Annotated[str, Field(min_length=3, max_length=200)],
     body: Annotated[str, Field(description="Markdown description: what changed, why, how it was verified.")],
     draft: Annotated[bool, Field()] = True,
     base: Annotated[str, Field()] = "main",
     head: Annotated[str, Field(description="Branch to merge; empty = current branch (must already be pushed).")] = "",
+    repo: REPO_ARG = None,
 ) -> str:
     """Open a pull request (draft by default, per CLAUDE.md: feature branch -> PR into main). Refuses if the branch
-    isn't pushed or the remote tip differs from the local one, so CI runs on what you tested."""
+    isn't pushed or the remote tip differs from the local one, so CI runs on what you tested. With `repo` (the server's own repository) the branch
+    is checked on GitHub instead, because the game checkout's origin is a different repository; `head` is then required."""
+    if repo and not head:
+        raise ToolError("Name the head branch when opening a pull request in another repository.")
     head = head or _git("rev-parse", "--abbrev-ref", "HEAD")
     if head in (base, "HEAD"):
         raise ToolError(f"Head branch {head!r} can't be the base; create a feature branch first.")
-    local = _git("rev-parse", head, check=False)
-    remote = _git("ls-remote", "origin", f"refs/heads/{head}", check=False).split("\t")[0]
-    if not remote:
-        raise ToolError(f"Branch {head!r} isn't on origin. Push it first: git push -u origin {head}")
-    if local and remote != local:
-        raise ToolError(f"origin/{head} is at {remote[:8]} but local {head} is at {local[:8]}; push (or pull) first.")
+    if repo:
+        try:
+            await gh().get(f"branches/{head}")
+        except Exception as e:
+            raise ToolError(f"Branch {head!r} isn't on {repo}: push it first ({e}).") from e
+    else:
+        local = _git("rev-parse", head, check=False)
+        remote = _git("ls-remote", "origin", f"refs/heads/{head}", check=False).split("	")[0]
+        if not remote:
+            raise ToolError(f"Branch {head!r} isn't on origin. Push it first: git push -u origin {head}")
+        if local and remote != local:
+            raise ToolError(f"origin/{head} is at {remote[:8]} but local {head} is at {local[:8]}; push (or pull) first.")
     existing = await gh().get("pulls", state="open", head=f"{gh().owner}:{head}")
     if existing:
         return f"An open PR already exists for {head}: #{existing[0]['number']} {existing[0]['html_url']}"

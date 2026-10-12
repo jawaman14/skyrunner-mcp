@@ -382,6 +382,39 @@ class RepoArgument(unittest.IsolatedAsyncioTestCase):
             server._gh = None
             server._gh_other.clear()
 
+    async def test_a_pull_request_in_another_repository_needs_its_head_and_checks_the_branch_on_github(self):
+        calls = []
+
+        class FakeGh:
+            owner = "o"
+            name = "server"
+
+            async def get(self, path, **params):
+                calls.append(("GET", path))
+                if path.startswith("branches/"):
+                    return {"name": path.split("/", 1)[1]}
+                return []
+
+            async def request(self, method, path, **kw):
+                calls.append((method, path))
+
+                class R:
+                    def json(self_inner):
+                        return {"number": 9, "html_url": "https://example/9"}
+                return R()
+
+        with patch.dict(os.environ, {"SKYRUNNER_GITHUB_REPO": "o/game", "SKYRUNNER_EXTRA_REPOS": "o/server"}):
+            server._gh = None
+            server._gh_other.clear()
+            with patch.object(server, "gh", lambda: FakeGh()):
+                with self.assertRaises(server.ToolError):
+                    await server.github_pr_create(title="clock tools", body="b", repo="o/server")
+                await server.github_pr_create(title="clock tools", body="b", head="claude/x", repo="o/server")
+            self.assertIn(("GET", "branches/claude/x"), calls, "the branch is looked up on GitHub, not in the game checkout")
+            self.assertIn(("POST", "pulls"), calls)
+            server._gh = None
+            server._gh_other.clear()
+
     async def test_other_repositories_and_malformed_names_are_refused(self):
         with patch.dict(os.environ, {"SKYRUNNER_GITHUB_REPO": "o/game", "SKYRUNNER_EXTRA_REPOS": "o/server"}):
             for bad in ("evil/repo", "o/server/extra", "o", "o/ser ver", "../x/y"):
