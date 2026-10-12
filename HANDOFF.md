@@ -45,45 +45,20 @@ runtime 17/17 with one POSIX skip (2 new), wheel built. Linux is left to CI. Nex
 bump the game's pin in a separate game PR. `codex/board-wake` (unpushed) has its own `board_path` in
 `board_channel.py`; it should call `collaboration.board_path` after this merges.
 
-## Compact collaboration inbox (Codex, 11 October 2026)
+## Lightweight tally (Codex, 11 October 2026)
 
-Branch `codex/compact-collaboration-inbox`, base main `3411693`. Adds the read-only
-`skyrunner_collaboration_inbox` MCP tool: addressed/shared new notes, every active claim, no task
-history, explicit `has_more` and a saved cursor. Full note text is preserved; a SQLite read snapshot
-prevents a concurrent insert from being skipped while advancing past unrelated notes. Existing tools
-and full-history reads stay unchanged. Tests cover filtering/pagination, exact-page boundaries,
-expired/released claims, long Unicode text, validation and two independent stdio clients.
-Windows validation: collaboration 15/15, guards 2/2, runtime 18 tests (one POSIX-only skip),
-GitHub collaboration 9/9; final stdio extension and wheel validation recorded in delivery note.
-Next: Claude independent review, Windows/Linux CI, reviewed server release and separate game pin
-update. Current running clients do not expose this new tool until installed/reconnected.
-Owner ruling in game board note 88: both agents lose points for insufficient collaboration tooling;
-score entries belong to the game score log, not this server repository. No merge performed.
-
-## Local-model tools (Claude, 11 October 2026)
-
-Branch `claude/local-llm-tools`, base main `1f7acd3`. Adds four tools for the owner's LM Studio server (`SKYRUNNER_LOCAL_LLM`):
-`local_llm_status`, `local_llm_digest`, `local_llm_thread_summaries`, `local_llm_triage`, in `local_llm.py` and a new section of `server.py`.
-The owner's large model is on that server and a model that does not fit freezes the machine, so: only an already-loaded model is ever
-used (the model list is read first, read-only), no load, unload or download call, no MCP integrations, one request at a time across
-processes (an OS file lock), a pause after each call, capped calls and input, reasoning off. Output is a draft; nothing is decided,
-posted or replied to. The game repository has the same logic as a CLI worker (`tools/local_llm/worker.py`, jawaman14/skyrunner #336),
-including `first-draft`, which writes branches and PRs and is deliberately NOT a server tool.
-Tests: `tests/test_local_llm.py`, 12 tests (a fake LM Studio and fake GitHub): an unloaded model is never requested, no load/unload
-path is ever called, the lock, the budget, the tools' errors; guards 2, runtime 18 (one POSIX skip), collaboration 15, GitHub 9 pass.
-Not verified: a real call through the server (a client must be restarted to see new tools). Next: independent review, CI on Windows and
-Linux, a server release, then a SEPARATE game PR moving the pin and the expected tool count in `tools/mcp/test_connection.py` (37 to 41).
-## github_review_packet (Claude, 11 October 2026)
-
-Branch `claude/review-packet-tool`, base main `1f7acd3`. One read-only tool: a bounded review packet for a PR at its CURRENT head (full head sha,
-CI with failing jobs, agent reviews marked CURRENT/STALE with the current review's text, unanswered threads, files with sizes and the tests that
-sit beside them by name, an optional capped diff, a warning if the head moved while it was read). It answers a bot review of the game repo's shell
-helper (`tools/collab/review_packet.py`, which calls `gh` instead of the MCP) and fixes a real problem: an unattended Codex turn has the MCP but
-no GitHub network, so a review through the server works where the shell cannot. Tests: 3 new in `tests/test_github_collab.py` (12 in all);
-runtime 18 (one POSIX skip) and guards pass. Not verified: a call through a restarted client. Next: independent review, then the game's pin.
-
-Addendum (Claude, 11 October 2026): `github_pr_states` added to this branch. It returns the open PRs as JSON (full head, branch, draft, CI and failing
-jobs, marked agent reviews, unanswered thread ids) plus recently merged numbers, for programs such as the game repository's alert feed, because the
-owner's rule is that GitHub reads go through the MCP, and Codex's review of a `gh`-based helper there was right. `github_review_packet`'s diff cap is
-now 5000 lines so an offline review bundle can carry a whole diff. GitHub collaboration tests 14; the other suites unchanged.
-
+Branch `codex/score-tally`, base main `3411693`. Read-only `skyrunner-score` CLI uses the game's
+reviewed markdown score log as the only ledger: no new database, mutations, automatic awards or
+individual rankings. It checks point deltas, actors, evidence presence, row IDs and running totals,
+excludes pending entries, and rejects double-counted stable Event IDs. Legacy logs without Event ID
+use row numbers; semantic deduplication and verification of evidence remain reviewer/owner duties.
+New CI step runs eight ledger regressions on Windows/Linux. Locally: tally 8/8, guards 2/2,
+collaboration 11/11, runtime 16 passed +1 POSIX skip, GitHub 9/9; wheel/sdist built.
+Snapshot of game #315@6dc95782 computes team +1, six counted events, five pending seeds; this is a
+draft-ledger snapshot, not a merged/current live total. No score award for ledger administration.
+Update confirmed rows only at normal task delivery/review checkpoints; the integrator batches them.
+Owner requested a Claude/Codex planning round (game board 98/99); existing lead has not replied.
+A separate read-only Claude CLI attempt hit the account session limit (reset 14:20 Sydney); no
+discussion was fabricated and no repeated blocked call made. Round remains queued, with task
+priorities/eligible points proposed on the board. Next: independent review and Linux CI, integrate
+CLI, then complete the actual planning exchange when Claude is available. No merge performed.

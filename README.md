@@ -77,6 +77,20 @@ one board between separate clones on one machine, set `SKYRUNNER_BOARD` to the s
 path in every client's environment (for example, an existing clone's
 `.git/skyrunner-mcp/collaboration.sqlite3`).
 
+## Lightweight score tally
+
+Keep the reviewed game `docs/COLLABORATION_SCORE.md` log as the only ledger. At normal delivery/review
+checkpoints, the integrator batches confirmed entries; no additional score-only messages or per-step calls.
+Run `skyrunner-score /path/to/COLLABORATION_SCORE.md` when a total is needed, or omit the path with an
+absolute `SKYRUNNER_ROOT`. The helper is read-only, checks running totals and duplicate IDs, excludes
+pending entries, and reports the team total without an individual ranking. It never verifies evidence
+or grants an award: reviewers/the owner do that. An absent/malformed ledger is an error, not a zero score.
+New entries should include a stable `Event ID` column so differently numbered duplicate awards are
+rejected. Historical rows without that column use their existing row IDs; they still require human
+deduplication. Corrections are separate event IDs linked to the original in the evidence column.
+Priority and expected eligibility belong in task handoffs, not the counted ledger. A planned +1/+2 is
+not an earned award. Ledger administration itself earns no points.
+
 ## Development and tests
 
 ```text
@@ -84,8 +98,7 @@ uv sync
 uv run python tests/test_guards.py src/skyrunner_mcp/server.py
 uv run python tests/test_runtime.py
 uv run python tests/test_collaboration.py
-uv run python tests/test_github_collab.py
-uv run python tests/test_local_llm.py
+uv run python tests/test_score_tally.py
 uv build
 ```
 
