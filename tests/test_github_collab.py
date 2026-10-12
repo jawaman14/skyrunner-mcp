@@ -255,5 +255,62 @@ class Sync(unittest.IsolatedAsyncioTestCase):
             await server.github_pr_sync_main()
 
 
+class IssueBody(unittest.IsolatedAsyncioTestCase):
+    async def test_replace_body_patches_the_issue_and_a_plain_write_still_comments(self):
+        calls = []
+
+        class Rec:
+            async def request(self, method, path, **kw):
+                calls.append((method, path, kw.get("json")))
+                return types.SimpleNamespace(json=lambda: {})
+        with patch.object(server, "gh", return_value=Rec()):
+            out = await server.github_issue_write(number=5, body="- [x] done", replace_body=True)
+            self.assertIn("body replaced", out)
+            self.assertEqual(calls[-1], ("PATCH", "issues/5", {"body": "- [x] done"}))
+            await server.github_issue_write(number=5, body="a comment")
+            self.assertEqual(calls[-1][:2], ("POST", "issues/5/comments"))
+            with self.assertRaises(server.ToolError):
+                await server.github_issue_write(number=5, body="", replace_body=True)
+
+
+class RepoArgument(unittest.IsolatedAsyncioTestCase):
+    """The PR tools take an optional `repo` so the agents can review and merge the server repository too, but only an allowed one."""
+
+    async def test_an_allowed_repo_routes_gh_to_it_for_that_call_only_and_never_leaks_to_the_next(self):
+        @server._scoped
+        async def which(repo=None):
+            return server.gh().name
+
+        with patch.dict(os.environ, {"SKYRUNNER_GITHUB_REPO": "o/game", "SKYRUNNER_EXTRA_REPOS": "o/server"}):
+            server._gh = None
+            server._gh_other.clear()
+            self.assertEqual(await which(), "game")
+            self.assertEqual(await which(repo="o/server"), "server")
+            self.assertEqual(await which(), "game", "a following call in the same context is back on the default repository")
+            self.assertEqual(await which(repo="o/server"), "server")
+            self.assertEqual(await which(repo=None), "game")
+            with self.assertRaises(server.ToolError):
+                await which(repo="evil/repo")
+            self.assertEqual(await which(), "game", "a refused repository changes nothing")
+            server._gh = None
+            server._gh_other.clear()
+
+    async def test_other_repositories_and_malformed_names_are_refused(self):
+        with patch.dict(os.environ, {"SKYRUNNER_GITHUB_REPO": "o/game", "SKYRUNNER_EXTRA_REPOS": "o/server"}):
+            for bad in ("evil/repo", "o/server/extra", "o", "o/ser ver", "../x/y"):
+                with self.assertRaises(server.ToolError, msg=bad):
+                    server._use_repo(bad)
+            self.assertIsNone(server._use_repo(None))
+            self.assertIsNone(server._use_repo(""))
+            self.assertEqual(server._use_repo("O/Game"), "O/Game")  # case-insensitive match on the default repository
+
+    async def test_the_tools_that_only_talk_to_github_take_a_repo_argument_and_the_local_git_ones_do_not(self):
+        import inspect
+        for name in ("github_pr_view", "github_pr_comment", "github_pr_merge", "github_pr_wait", "github_pr_review", "github_ci_status", "github_ci_logs", "github_pr_diff"):
+            self.assertIn("repo", inspect.signature(getattr(server, name)).parameters, name)
+        for name in ("github_merge_queue", "github_pr_sync_main", "github_pr_triage"):
+            self.assertNotIn("repo", inspect.signature(getattr(server, name)).parameters, name)
+
+
 if __name__ == "__main__":
     unittest.main()
