@@ -1,6 +1,7 @@
 """The collaboration GitHub tools: waiting on CI, cross-agent reviews, the merge queue, syncing with the default
 branch and reading a merge's resolution. GitHub is faked; git runs on throwaway repositories. No network."""
 import asyncio
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -182,6 +183,92 @@ class Diff(unittest.IsolatedAsyncioTestCase):
                 await server.github_pr_diff(7, path="nothing-here")
 
 
+class Packet(unittest.IsolatedAsyncioTestCase):
+    """github_review_packet: one bounded read of a PR at its current head, from the server, so a turn with no network can review."""
+
+    def fake(self, head=HEAD, moves_to=None):
+        files = [{"filename": "scripts/sim/people.gd", "status": "modified", "additions": 10, "deletions": 2, "patch": "@@ -1 +1 @@\n-a\n+b"},
+                 {"filename": "tests/test_people.gd", "status": "added", "additions": 5, "deletions": 0, "patch": "+t"},
+                 {"filename": "tools/collab/test_collab_tools.py", "status": "modified", "additions": 3, "deletions": 0, "patch": "+x"}]
+        comments = [{"id": 1, "path": "a.gd", "line": 3, "user": {"login": "bot"}, "body": "unanswered finding"},
+                    {"id": 2, "path": "b.gd", "line": 4, "user": {"login": "bot"}, "body": "answered finding"},
+                    {"id": 3, "in_reply_to_id": 2, "user": {"login": "me"}, "body": "done"}]
+        reviews = [review("codex", "approve", OLD), review("codex", "changes", head)]
+        seen = {"gets": 0}
+
+        class Fake(FakeGitHub):
+            async def get(self, path, **params):
+                if path == "pulls/7":
+                    seen["gets"] += 1
+                    sha = moves_to if (moves_to and seen["gets"] > 1) else head
+                    return {"number": 7, "head": {"sha": sha, "ref": "claude/feature", "repo": {"full_name": "o/r"}}, "base": {"ref": "main"},
+                            "draft": False, "title": "Fix people", "user": {"login": "owner"}, "created_at": "2026-10-11T00:00:00Z"}
+                return await super().get(path, **params)
+
+            async def paged(self, path, **kwargs):
+                if path == "pulls/7/files":
+                    return files
+                return await super().paged(path, **kwargs)
+        return Fake(reviews=reviews, comments=comments)
+
+    async def test_the_packet_has_the_full_head_ci_marked_reviews_threads_files_and_tests(self):
+        with patch.object(server, "gh", return_value=self.fake()):
+            text = await server.github_review_packet(7)
+        self.assertIn("head " + HEAD, text, "the full 40-character head")
+        self.assertIn("CI on this head: success", text)
+        self.assertIn("Agent review by codex: approve at " + OLD[:7] + " (STALE: older head)", text)
+        self.assertIn("Agent review by codex: changes at " + HEAD[:7] + " (CURRENT)", text)
+        self.assertIn("Unanswered review threads: 1", text)
+        self.assertIn("a.gd:3", text)
+        self.assertNotIn("b.gd:4", text, "an answered thread is not listed")
+        self.assertIn("+10/-2 scripts/sim/people.gd   tests by name: tests/test_people.gd", text)
+        self.assertIn("The PR changes 2 test file(s)", text, "tests outside tests/ count too")
+        self.assertLess(len(text), 3000, "bounded")
+
+    async def test_the_diff_is_capped_and_a_head_that_moves_is_flagged(self):
+        with patch.object(server, "gh", return_value=self.fake(moves_to="d" * 40)):
+            text = await server.github_review_packet(7, diff_lines=4)
+        self.assertIn("Diff (first 4 of", text)
+        self.assertIn("WARNING: the head moved while this was read", text)
+
+    async def test_the_tool_is_registered_and_read_only(self):
+        tools = {t.name: t for t in await server.mcp.list_tools()}
+        self.assertIn("github_review_packet", tools)
+        self.assertTrue(tools["github_review_packet"].annotations.read_only_hint)
+
+
+class States(unittest.IsolatedAsyncioTestCase):
+    async def test_the_states_are_json_with_the_full_head_marked_reviews_waiting_threads_and_merged_numbers(self):
+        comments = [{"id": 1, "path": "a.gd", "line": 3, "user": {"login": "bot"}, "body": "unanswered"},
+                    {"id": 2, "path": "b.gd", "line": 4, "user": {"login": "bot"}, "body": "answered"}, {"id": 3, "in_reply_to_id": 2, "user": {"login": "me"}, "body": "ok"}]
+
+        class Fake(FakeGitHub):
+            async def paged(self, path, **kwargs):
+                if path == "pulls" and kwargs.get("state") == "closed":
+                    return [{"number": 5, "merged_at": "2026-10-11T00:00:00Z"}, {"number": 6, "merged_at": None}]
+                return await super().paged(path, **kwargs)
+
+        fake = Fake(reviews=[review("codex", "approve", HEAD)], comments=comments)
+        with patch.object(server, "gh", return_value=fake), patch.object(server, "_fetch_origin", lambda: None), \
+                patch.object(server, "_merge_state", lambda base, ref: {"clean": False, "behind": 3, "ahead": 1}):
+            data = json.loads(await server.github_pr_states())
+        self.assertEqual(data["merged"], [5], "closed without a merge is not merged")
+        pr = data["open"][0]
+        self.assertEqual((pr["number"], pr["head"], pr["branch"], pr["ci"]), (7, HEAD, "claude/feature", "success"))
+        self.assertEqual(pr["reviews"], [{"agent": "codex", "verdict": "approve", "head": HEAD}])
+        self.assertEqual((pr["conflicts"], pr["behind"]), (True, 3))
+        self.assertEqual(pr["merge_state"], "known")
+        with patch.object(server, "gh", return_value=fake), patch.object(server, "_fetch_origin", lambda: None), \
+                patch.object(server, "_merge_state", lambda base, ref: {"state": "branch not fetched"}):
+            unknown = json.loads(await server.github_pr_states())["open"][0]
+        self.assertEqual((unknown["conflicts"], unknown["merge_state"]), (None, "branch not fetched"))
+        self.assertEqual([w["id"] for w in pr["waiting"]], [1])
+
+    async def test_the_tool_is_registered_read_only(self):
+        tools = {t.name: t for t in await server.mcp.list_tools()}
+        self.assertTrue(tools["github_pr_states"].annotations.read_only_hint)
+
+
 class Sync(unittest.IsolatedAsyncioTestCase):
     """github_pr_sync_main and skyrunner_merge_resolution on a real origin, clone and conflicting branch."""
 
@@ -253,6 +340,63 @@ class Sync(unittest.IsolatedAsyncioTestCase):
         self.git(self.clone, "checkout", "main")
         with self.assertRaises(server.ToolError):
             await server.github_pr_sync_main()
+
+
+class IssueBody(unittest.IsolatedAsyncioTestCase):
+    async def test_replace_body_patches_the_issue_and_a_plain_write_still_comments(self):
+        calls = []
+
+        class Rec:
+            async def request(self, method, path, **kw):
+                calls.append((method, path, kw.get("json")))
+                return types.SimpleNamespace(json=lambda: {})
+        with patch.object(server, "gh", return_value=Rec()):
+            out = await server.github_issue_write(number=5, body="- [x] done", replace_body=True)
+            self.assertIn("body replaced", out)
+            self.assertEqual(calls[-1], ("PATCH", "issues/5", {"body": "- [x] done"}))
+            await server.github_issue_write(number=5, body="a comment")
+            self.assertEqual(calls[-1][:2], ("POST", "issues/5/comments"))
+            with self.assertRaises(server.ToolError):
+                await server.github_issue_write(number=5, body="", replace_body=True)
+
+
+class RepoArgument(unittest.IsolatedAsyncioTestCase):
+    """The PR tools take an optional `repo` so the agents can review and merge the server repository too, but only an allowed one."""
+
+    async def test_an_allowed_repo_routes_gh_to_it_for_that_call_only_and_never_leaks_to_the_next(self):
+        @server._scoped
+        async def which(repo=None):
+            return server.gh().name
+
+        with patch.dict(os.environ, {"SKYRUNNER_GITHUB_REPO": "o/game", "SKYRUNNER_EXTRA_REPOS": "o/server"}):
+            server._gh = None
+            server._gh_other.clear()
+            self.assertEqual(await which(), "game")
+            self.assertEqual(await which(repo="o/server"), "server")
+            self.assertEqual(await which(), "game", "a following call in the same context is back on the default repository")
+            self.assertEqual(await which(repo="o/server"), "server")
+            self.assertEqual(await which(repo=None), "game")
+            with self.assertRaises(server.ToolError):
+                await which(repo="evil/repo")
+            self.assertEqual(await which(), "game", "a refused repository changes nothing")
+            server._gh = None
+            server._gh_other.clear()
+
+    async def test_other_repositories_and_malformed_names_are_refused(self):
+        with patch.dict(os.environ, {"SKYRUNNER_GITHUB_REPO": "o/game", "SKYRUNNER_EXTRA_REPOS": "o/server"}):
+            for bad in ("evil/repo", "o/server/extra", "o", "o/ser ver", "../x/y"):
+                with self.assertRaises(server.ToolError, msg=bad):
+                    server._use_repo(bad)
+            self.assertIsNone(server._use_repo(None))
+            self.assertIsNone(server._use_repo(""))
+            self.assertEqual(server._use_repo("O/Game"), "O/Game")  # case-insensitive match on the default repository
+
+    async def test_the_tools_that_only_talk_to_github_take_a_repo_argument_and_the_local_git_ones_do_not(self):
+        import inspect
+        for name in ("github_pr_view", "github_pr_comment", "github_pr_merge", "github_pr_wait", "github_pr_review", "github_ci_status", "github_ci_logs", "github_pr_diff"):
+            self.assertIn("repo", inspect.signature(getattr(server, name)).parameters, name)
+        for name in ("github_merge_queue", "github_pr_sync_main", "github_pr_triage"):
+            self.assertNotIn("repo", inspect.signature(getattr(server, name)).parameters, name)
 
 
 if __name__ == "__main__":

@@ -134,3 +134,11 @@ uv run python tests/test_collaboration.py
 The runtime suite initializes two real stdio clients. The coordination suite races independent processes,
 checks overlapping claims, renewal/expiry, ownership, durable inbox cursors and kernel lock contention.
 These tests do not launch an actual Claude session and do not mutate GitHub.
+
+## Compact inbox polling
+
+After startup, prefer `skyrunner_collaboration_inbox(recipient="codex" or "claude", after=<saved next_cursor>)`.
+It returns all active file claims and complete new addressed/shared notes without repeating task history.
+Drain pages while `has_more` is true, keeping each returned `next_cursor`. The cursor is a caller-side
+position, not a delivery receipt, authorization or proof that the other agent read a note. Use
+`skyrunner_collaboration_read` for task history. Reconnect clients after installing a server update.

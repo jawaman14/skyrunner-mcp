@@ -193,3 +193,29 @@ class Board:
         for task in active_claims:
             task["paths"] = json.loads(task["paths"])
         return {"active_claims": active_claims, "tasks": tasks, "notes": [dict(x) for x in notes], "next_cursor": notes[-1]["id"] if len(notes) == limit else max(after, high), "shared_store": str(self.path)}
+
+
+    def inbox(self, recipient, after=0, limit=10):
+        """Small incremental poll: all active claims, new addressed notes, no task history.
+
+        Read one SQLite snapshot so advancing past unrelated notes cannot hide a concurrent note.
+        Never truncate note text or paginate claims: callers need complete collision evidence.
+        """
+        if recipient not in ("claude", "codex") or after < 0 or not 1 <= limit <= 100:
+            raise ValueError("Use recipient claude/codex, a nonnegative cursor and limit 1–100.")
+        with self.connect() as db:
+            db.execute("BEGIN")
+            active = [dict(x) for x in db.execute(
+                "SELECT id,owner,title,paths,checkout,revision,expires FROM tasks "
+                "WHERE status='active' AND expires>? ORDER BY updated DESC,id", (time.time(),))]
+            notes = db.execute(
+                "SELECT * FROM notes WHERE id>? AND recipient IN ('all',?) ORDER BY id LIMIT ?",
+                (after, recipient, limit + 1)).fetchall()
+            high = db.execute("SELECT COALESCE(MAX(id),0) FROM notes").fetchone()[0]
+        has_more = len(notes) > limit
+        notes = notes[:limit]
+        for task in active:
+            task["paths"] = json.loads(task["paths"])
+        return {"active_claims": active, "notes": [dict(x) for x in notes],
+                "next_cursor": notes[-1]["id"] if has_more else max(after, high),
+                "has_more": has_more, "shared_store": str(self.path)}

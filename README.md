@@ -34,6 +34,9 @@ dispatch without authentication. GitHub tools operate on the **game checkout's o
 
 - Collaboration: `skyrunner_collaboration_start`, `read`, `claim`, `update`, `note` (full names retain the
   `skyrunner_collaboration_` prefix). Start with `start`, verify target/revision and read the shared inbox.
+- Compact polling: `skyrunner_collaboration_inbox(recipient, after, limit=10)` returns new addressed/shared
+  notes and all active claims, without completed-task history. Save `next_cursor`; drain pages while
+  `has_more` is true. Notes are never clipped. Use `read` when you need historical tasks.
 - Game: filtered tests, import, smoke, screenshots, balance, scripts, command/switch introspection and
   project-status checks. Long jobs return IDs; poll their owning client instead of restarting them.
 - Jobs: status/logs/cancellation. Kernel locks serialize Godot work per checkout across MCP processes, and a
@@ -47,8 +50,20 @@ dispatch without authentication. GitHub tools operate on the **game checkout's o
   its CI, the other agent's review and a READY / blocked verdict), `github_pr_diff` (the diff, file by file),
   `github_pr_sync_main` and `skyrunner_merge_resolution` (merge the default branch in; read only how conflicts
   were resolved).
+  `github_review_packet` (one bounded read of a PR at its current head for a reviewer: the full head sha, CI with the failing jobs,
+  agent reviews marked CURRENT or STALE, unanswered threads, files with the tests that sit beside them, an optional capped diff; it works
+  where a shell has no network, because the server makes the calls).
+  `github_pr_states` (the open PRs as JSON for a program: full head sha, branch, draft, CI with failing jobs, marked agent reviews, unanswered
+  review thread ids, and recently merged numbers; the alert feed reads it instead of calling `gh`).
 
-All 30 existing tool names are preserved. The bundled `mcp_introspect.gd` adapter reads the target game's
+- Local model (LM Studio, optional): `local_llm_status`, `local_llm_digest` (a log or a PR diff), `local_llm_thread_summaries`
+  (what each unanswered review comment asks and what to check, never a verdict or a reply) and `local_llm_triage` (open PRs: the
+  review tier from the file paths, no model, plus a one-line summary). Set `SKYRUNNER_LOCAL_LLM` to the server address. The owner's
+  large model lives on that server, so these tools use only a model that is **already loaded** (they read `/api/v1/models`, read-only,
+  first), never call a load, unload or download endpoint and never use its MCP integrations, run one request at a time across every
+  agent's server process, pause after each call and keep reasoning off by default. Their output is a draft for an agent to check.
+
+All 30 original tool names are preserved. The bundled `mcp_introspect.gd` adapter reads the target game's
 compiled command/role/switch definitions, so no server implementation needs to live in the game repository.
 The test worker and collaboration guide ship inside the package, including wheels.
 
@@ -91,6 +106,34 @@ Tests create temporary fixture projects; they require neither Godot nor a Skyrun
 real GitHub writes. Windows/Linux CI runs the same checks. Actual game integration remains a separate
 validation in the game's repository. After server updates, reconnect clients; running clients do not
 hot-load tools. See [SOURCE.md](SOURCE.md) for extraction provenance.
+
+## Diagnose noisy Godot logs
+
+Claude (or Codex) can index an existing log without rerunning the failed job:
+
+```text
+skyrunner-log-digest /absolute/path/to/job.log --limit 30
+```
+
+Before installation, set `PYTHONPATH` to this worktree's `src` directory and run
+`python -m skyrunner_mcp.log_digest /absolute/path/to/job.log`. The tool is read-only and
+does not require a client restart, Godot run, board write or network call.
+Alternatively invoke `python /absolute/path/to/src/skyrunner_mcp/log_digest.py LOG`
+directly; this standalone helper needs only Python's standard library.
+
+JSON groups repeated diagnostic text plus immediately following source/traceback locations,
+with occurrence counts and first/last log line numbers. Distinct locations stay distinct;
+diagnostic text is not clipped. Test summaries remain in source order. Missing summaries,
+zero tests, failed tests and omitted groups are explicit flags. Exit zero means indexing
+succeeded; `verdict` is always `not_assessed`. It cannot certify the job's exit status,
+complete output, test coverage or absence of errors in an unrecognized format. Read the
+original log at the returned line numbers when investigating, and use actual job/CI status
+for acceptance. Timestamp-prefixed repeats may remain separate groups.
+
+Recipient validation: Claude should use a real existing failing log, compare the digest to
+the full log and report whether it reduced investigation effort while retaining the needed
+diagnostics. No reward is earned for implementing or merely demonstrating compression;
+the owner's requested +1 remains pending until actual improvement is confirmed.
 
 ## Licences
 

@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import contextvars
+import functools
 import hashlib
 import json
 import logging
@@ -37,6 +39,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field
 from .collaboration import Board, MachineLock, ProjectLock, board_path, machine_lock_path
+from . import local_llm as _llm
 
 logging.getLogger("httpx").setLevel(logging.WARNING)  # one INFO line per request otherwise
 
@@ -57,6 +60,7 @@ READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempot
 LOCAL_RUN = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False)
 LOCAL_WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=False)
 GH_READ = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True)
+LOCAL_LLM = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True)
 GH_WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=True)
 GH_DESTRUCTIVE = ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=True)
 
@@ -104,6 +108,21 @@ async def skyrunner_collaboration_read(after: int = 0, recipient: Literal["all",
                                       limit: Annotated[int, Field(ge=1, le=100)] = 30) -> str:
     """Read shared claims and persistent notes. Keep next_cursor for incremental reads."""
     return json.dumps(_board().read(after, recipient, limit), ensure_ascii=False)
+
+
+@mcp.tool(name="skyrunner_collaboration_inbox", annotations=READ_ONLY)
+async def skyrunner_collaboration_inbox(recipient: Literal["claude", "codex"],
+                                       after: Annotated[int, Field(ge=0)] = 0,
+                                       limit: Annotated[int, Field(ge=1, le=100)] = 10) -> str:
+    """Compact poll: new addressed/shared notes and all active claims, without task history.
+
+    Save next_cursor; read again while has_more is true. Notes are complete, never clipped.
+    Use collaboration_read for task history. This does not acknowledge delivery or grant authorization.
+    """
+    try:
+        return json.dumps(_board().inbox(recipient, after, limit), ensure_ascii=False)
+    except ValueError as e:
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool(name="skyrunner_collaboration_claim", annotations=LOCAL_RUN)
@@ -713,8 +732,8 @@ def _token(required: bool = True) -> str:
 
 
 class GitHub:
-    def __init__(self) -> None:
-        self.owner, self.name = _repo()
+    def __init__(self, repo: str = "") -> None:
+        self.owner, self.name = repo.split("/", 1) if repo else _repo()
         self.base = os.environ.get("SKYRUNNER_GITHUB_API", "https://api.github.com").rstrip("/")
         token = _token(required=False)
         self.authenticated = bool(token)
@@ -762,13 +781,62 @@ class GitHub:
 
 
 _gh: GitHub | None = None
+_gh_other: dict[str, GitHub] = {}
+_repo_var: contextvars.ContextVar[str] = contextvars.ContextVar("skyrunner_github_repo", default="")
+# Repositories (besides the default one this server is rooted in) that the PR tools with a `repo` argument may reach. Comma-separated
+# owner/name pairs in SKYRUNNER_EXTRA_REPOS; the default is this server's own repository, which the agents also review and merge.
+DEFAULT_EXTRA_REPOS = "jawaman14/skyrunner-mcp"
+
+
+def _allowed_repos() -> set[str]:
+    owner, name = _repo()
+    allowed = {f"{owner}/{name}".lower()}
+    for item in os.environ.get("SKYRUNNER_EXTRA_REPOS", DEFAULT_EXTRA_REPOS).split(","):
+        if item.strip():
+            allowed.add(item.strip().lower())
+    return allowed
+
+
+def _use_repo(repo: str | None) -> str | None:
+    """Validate `repo` (owner/name) for a tool call: returns it, or None for the default repository. Refuses one that is not allowed."""
+    if not repo:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+        raise ToolError(f"repo must be owner/name, not {repo!r}.")
+    if repo.lower() not in _allowed_repos():
+        raise ToolError(f"{repo} is not an allowed repository (allowed: {', '.join(sorted(_allowed_repos()))}; "
+                        f"set SKYRUNNER_EXTRA_REPOS to add one).")
+    return repo
+
+
+def _scoped(fn):
+    """Run a tool with `gh()` pointed at its `repo` argument for that call only, and restore the previous repository afterwards, so a later call that names
+    no repo can never inherit this one (the reset is in a finally)."""
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        repo = _use_repo(kwargs.get("repo"))
+        token = _repo_var.set(repo or "")
+        try:
+            return await fn(*args, **kwargs)
+        finally:
+            _repo_var.reset(token)
+    return wrapper
 
 
 def gh() -> GitHub:
     global _gh
+    other = _repo_var.get()
+    if other:
+        if other not in _gh_other:
+            _gh_other[other] = GitHub(other)
+        return _gh_other[other]
     if _gh is None:
         _gh = GitHub()
     return _gh
+
+
+REPO_ARG = Annotated[str | None, Field(description="Optional owner/name of another allowed repository (default: this project's repository). "
+                                                   "Lets the PR tools work on the skyrunner-mcp server repository too.")]
 
 
 def _when(ts: str | None) -> str:
@@ -851,9 +919,11 @@ async def _ref_for(ref: str) -> tuple[str, str]:
 
 
 @mcp.tool(name="github_ci_status", annotations=GH_READ)
+@_scoped
 async def github_ci_status(
     ref: Annotated[str, Field(description="PR number (e.g. '293'), branch or commit sha; empty = current branch.")] = "",
     runs: Annotated[int, Field(description="How many recent workflow runs to list.", ge=1, le=20)] = 3,
+    repo: REPO_ARG = None,
 ) -> str:
     """GitHub Actions runs for a PR/branch/commit and the per-job results of the latest one, with the job ids that
     github_ci_logs takes. The workflow is .github/workflows/skyrunner-beta.yml (test lanes, exports, smoke)."""
@@ -876,9 +946,11 @@ async def github_ci_status(
 
 
 @mcp.tool(name="github_ci_logs", annotations=GH_READ)
+@_scoped
 async def github_ci_logs(
     job_id: Annotated[int, Field(description="Job id from github_ci_status.")],
     tail_lines: Annotated[int, Field(ge=0, le=500)] = 60,
+    repo: REPO_ARG = None,
 ) -> str:
     """A CI job's log reduced to what matters: FAIL / SCRIPT ERROR / Parse Error / GitHub ##[error] lines (with
     their `at:` locations) plus the last lines. Timestamps are stripped."""
@@ -897,7 +969,8 @@ async def github_ci_logs(
 
 
 @mcp.tool(name="github_pr_view", annotations=GH_READ)
-async def github_pr_view(number: Annotated[int, Field(ge=1)]) -> str:
+@_scoped
+async def github_pr_view(number: Annotated[int, Field(ge=1)], repo: REPO_ARG = None) -> str:
     """A PR's description, mergeability, changed files, reviews and inline review comments (unresolved context)."""
     p = await gh().get(f"pulls/{number}")
     files = await gh().paged(f"pulls/{number}/files", limit=300)
@@ -948,11 +1021,13 @@ async def github_pr_create(
 
 
 @mcp.tool(name="github_pr_comment", annotations=GH_WRITE)
+@_scoped
 async def github_pr_comment(
     number: Annotated[int, Field(description="PR or issue number.", ge=1)],
     body: Annotated[str, Field(min_length=1)],
     reply_to_comment_id: Annotated[int | None, Field(description="Inline review comment id (from github_pr_view) "
                                                                   "to reply in its thread instead.")] = None,
+    repo: REPO_ARG = None,
 ) -> str:
     """Comment on a PR or issue, or reply in an inline review thread."""
     if reply_to_comment_id:
@@ -995,6 +1070,7 @@ async def _mark_ready(number: int) -> None:
 
 
 @mcp.tool(name="github_pr_merge", annotations=GH_DESTRUCTIVE)
+@_scoped
 async def github_pr_merge(
     number: Annotated[int, Field(ge=1)],
     expected_head_sha: Annotated[str, Field(description="The full head commit you checked CI on (github_ci_status). "
@@ -1004,6 +1080,7 @@ async def github_pr_merge(
     title: Annotated[str | None, Field(description="Squash commit title; default: the PR title and number.")] = None,
     reviewed_comments: Annotated[bool, Field(description="Set true only after reading every review comment listed in a "
                                                           "previous refusal. Does not bypass any other check.")] = False,
+    repo: REPO_ARG = None,
 ) -> str:
     """Merge a PR, but only if it is open, not a draft, mergeable, still at `expected_head_sha`, every job of the
     latest workflow run on that commit succeeded, and no review thread is waiting for a reply (bot reviews arrive
@@ -1127,11 +1204,13 @@ def _queue_blockers(author: str, draft: bool, ci_state: str, reviews: list[dict]
 
 
 @mcp.tool(name="github_pr_wait", annotations=GH_READ)
+@_scoped
 async def github_pr_wait(
     number: Annotated[int, Field(ge=1)],
     timeout_seconds: Annotated[int, Field(description="Give up and report after this long.", ge=30, le=600)] = 540,
     review_grace_seconds: Annotated[int, Field(description="After CI finishes, how long to wait for the automated "
                                                             "review that follows it.", ge=0, le=600)] = 150,
+    repo: REPO_ARG = None,
 ) -> str:
     """Wait here, on the server, until CI on the PR's head finishes and the bot review that lands a couple of minutes
     later has had time to arrive, then report both: one call instead of polling github_ci_status. Returns early with
@@ -1173,6 +1252,7 @@ async def github_pr_wait(
 
 
 @mcp.tool(name="github_pr_review", annotations=GH_WRITE)
+@_scoped
 async def github_pr_review(
     number: Annotated[int, Field(ge=1)],
     reviewer: Annotated[str, Field(description="Your session owner id, e.g. codex-<thread id> or claude-<session id>.")],
@@ -1182,6 +1262,7 @@ async def github_pr_review(
     expected_head_sha: Annotated[str, Field(description="The head you reviewed; refused if the PR has moved since.",
                                             min_length=40, max_length=40)],
     comments: Annotated[list[dict], Field(description="Inline comments: [{path, line, body}] on the PR's new code.")] = [],
+    repo: REPO_ARG = None,
 ) -> str:
     """Record a cross-agent review on the PR itself, where every agent and machine can see it (the board doesn't
     leave this computer). The verdict is pinned to the head you reviewed: a later push needs a fresh review.
@@ -1244,6 +1325,106 @@ async def github_merge_queue(
     return f"{ready} of {len(entries)} ready to merge into {default}.\n\n" + "\n".join(rows)
 
 
+def _is_test_path(path: str) -> bool:
+    base = path.rsplit("/", 1)[-1]
+    named = base.startswith("test_") and base.endswith((".py", ".gd"))
+    return (path.startswith("tests/") or named or base.endswith("_test.py")) and not path.endswith((".uid", ".json"))
+
+
+@mcp.tool(name="github_review_packet", annotations=GH_READ)
+async def github_review_packet(number: Annotated[int, Field(ge=1)], diff_lines: Annotated[int, Field(ge=0, le=5000)] = 0) -> str:
+    """One bounded read of a pull request at its CURRENT head, for a reviewer: the full head sha, files with sizes, the tests that sit
+    beside changed files by name (a heuristic, not dependency analysis), CI with the failing jobs named, every agent review marked CURRENT or
+    STALE against the head, the review bodies of current reviews, the unanswered review threads, and optionally the first `diff_lines` lines of
+    the diff. It replaces five GitHub calls and works where the shell has no network, because the server makes the calls."""
+    p = await gh().get(f"pulls/{number}")
+    head = p["head"]["sha"]
+    files = await gh().paged(f"pulls/{number}/files", limit=300)
+    raw_reviews = await gh().paged(f"pulls/{number}/reviews", limit=100)
+    marked = _marked_reviews(raw_reviews)
+    waiting = await _waiting_comments(number)
+    ci = await _head_ci(head)
+    paths = {f["filename"] for f in files}
+    removed = {f["filename"] for f in files if f["status"] == "removed"}
+    tests_by_name = {}
+    for f in files:
+        name = f["filename"]
+        stem = name.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        if name.startswith("tests/") or not name.endswith(".gd"):
+            continue
+        cand = f"tests/test_{stem}.gd"
+        if cand not in removed and (cand in paths or (ROOT / cand).is_file()):
+            tests_by_name[name] = cand
+    out = [f"PR #{number} {'[draft] ' if p.get('draft') else ''}{p['title']} | {p['user']['login']} {p['head']['ref']} -> {p['base']['ref']}",
+           f"head {head}",
+           f"CI on this head: {ci['state']}" + (f" ({ci['jobs']} jobs)" if ci["jobs"] else "") + (f"; failing: {'; '.join(ci['bad'])}" if ci["bad"] else "")]
+    if not marked:
+        out.append("Agent reviews: none")
+    for r in marked:
+        out.append(f"Agent review by {r['agent']}: {r['verdict']} at {r['head'][:7]} ({'CURRENT' if r['head'] == head else 'STALE: older head'})")
+    for r in raw_reviews:
+        m = _REVIEW_RE.search(r.get("body") or "")
+        if m and m.group(3) == head:
+            body = " ".join((_REVIEW_RE.sub("", r.get("body") or "")).split())[:300]
+            out.append(f"  review text ({m.group(1)}): {body}")
+    out.append(f"Unanswered review threads: {len(waiting)}")
+    for c in waiting[:8]:
+        out.append(f"  {c.get('path')}:{c.get('line') or c.get('original_line')} {c['user']['login']}: {' '.join(str(c.get('body', '')).split())[:200]}")
+    total_add = sum(f["additions"] for f in files)
+    total_del = sum(f["deletions"] for f in files)
+    out.append(f"Files ({len(files)}, +{total_add}/-{total_del}):")
+    for f in files[:30]:
+        tail = f"   tests by name: {tests_by_name[f['filename']]}" if f["filename"] in tests_by_name else ""
+        out.append(f"  +{f['additions']}/-{f['deletions']} {f['filename']}{tail}")
+    if len(files) > 30:
+        out.append(f"  ... {len(files) - 30} more files")
+    changed_tests = sorted(n for n in paths - removed if _is_test_path(n))
+    out.append(f"The PR changes {len(changed_tests)} test file(s)" + (": " + ", ".join(changed_tests[:6]) if changed_tests else "") +
+               ". (Tests by name are a heuristic, not a dependency analysis.)")
+    if diff_lines:
+        lines = []
+        for f in files:
+            lines += [f"### {f['filename']} ({f['status']})"] + (f.get("patch") or "(no patch: binary or too large)").splitlines()
+        out.append(f"Diff (first {min(diff_lines, len(lines))} of {len(lines)} lines):")
+        out += lines[:diff_lines]
+    now = (await gh().get(f"pulls/{number}"))["head"]["sha"]
+    if now != head:
+        out.append(f"WARNING: the head moved while this was read (now {now[:8]}); run it again.")
+    return "\n".join(out)
+
+
+@mcp.tool(name="github_pr_states", annotations=GH_READ)
+async def github_pr_states(
+    limit: Annotated[int, Field(ge=1, le=60)] = 40,
+    merged_limit: Annotated[int, Field(ge=0, le=30)] = 10,
+) -> str:
+    """The open PRs as JSON for a program to read (the alert feed): per PR its number, title, FULL head sha, branch, draft flag, whether it
+    conflicts with the default branch (null with a merge_state reason when unknown, e.g. a fork or an unfetched branch) and how far behind it is, CI state on the head with the failing jobs, the marked agent reviews (agent, verdict, head), and the ids of unanswered review
+    threads; plus the numbers of recently merged PRs. The same facts as github_merge_queue, without the prose."""
+    pulls = await gh().paged("pulls", limit=limit, state="open")
+    await asyncio.to_thread(_fetch_origin)
+    default = (await gh().get(gh().repo))["default_branch"]
+    rows = []
+    for p in pulls:
+        head = p["head"]["sha"]
+        n = p["number"]
+        same_repo = p["head"]["repo"] and p["head"]["repo"]["full_name"] == f"{gh().owner}/{gh().name}"
+        merge = await asyncio.to_thread(_merge_state, default, p["head"]["ref"]) if same_repo else {"state": "fork"}
+        ci = await _head_ci(head)
+        reviews = _marked_reviews(await gh().paged(f"pulls/{n}/reviews", limit=100))
+        waiting = await _waiting_comments(n)
+        rows.append({"number": n, "title": p["title"], "head": head, "branch": p["head"]["ref"], "draft": bool(p["draft"]),
+                     "conflicts": (not merge["clean"]) if "clean" in merge else None, "behind": merge.get("behind"), "merge_state": "known" if "clean" in merge else merge.get("state", "unknown"), "ci": ci["state"], "ci_bad": ci["bad"],
+                     "reviews": [{"agent": r["agent"], "verdict": r["verdict"], "head": r["head"]} for r in reviews],
+                     "waiting": [{"id": c["id"], "path": c.get("path"), "line": c.get("line") or c.get("original_line"),
+                                  "body": " ".join(str(c.get("body", "")).split())[:600]} for c in waiting[:20]]})
+    merged = []
+    if merged_limit:
+        done = await gh().paged("pulls", limit=merged_limit, state="closed", sort="updated", direction="desc")
+        merged = [p["number"] for p in done if p.get("merged_at")][:merged_limit]
+    return json.dumps({"open": rows, "merged": merged})
+
+
 @mcp.tool(name="github_pr_sync_main", annotations=LOCAL_WRITE)
 async def github_pr_sync_main(
     push: Annotated[bool, Field(description="Push the merge if it was clean. Default: leave it for your tests first.")] = False,
@@ -1304,10 +1485,12 @@ async def skyrunner_merge_resolution(
 
 
 @mcp.tool(name="github_pr_diff", annotations=GH_READ)
+@_scoped
 async def github_pr_diff(
     number: Annotated[int, Field(ge=1)],
     path: Annotated[str, Field(description="Only files whose path contains this text; empty = all (the list first).")] = "",
     max_chars: Annotated[int, Field(ge=1000, le=60000)] = 20000,
+    repo: REPO_ARG = None,
 ) -> str:
     """The PR's actual diff as GitHub has it at the head, file by file, so a reviewer on any worktree or machine reads
     the same source change without a checkout: a list of files with sizes when `path` is empty, the patches of the
@@ -1400,13 +1583,21 @@ async def github_issue_write(
     body: Annotated[str, Field(description="New issue body, or the comment for an existing issue.")] = "",
     labels: Annotated[list[str], Field(description="Labels for a new issue.")] = [],
     close: Annotated[Literal["", "completed", "not_planned"], Field(description="Close an existing issue with this reason.")] = "",
+    replace_body: Annotated[bool, Field(description="With a number: replace the issue's own body with `body` (to tick a checklist) instead of adding a comment.")] = False,
 ) -> str:
-    """Create an issue, or comment on and optionally close an existing one."""
+    """Create an issue, or comment on, edit the body of, and optionally close an existing one."""
     if number is None:
         if not title:
             raise ToolError("Give a title to create an issue, or a number to comment on one.")
         i = (await gh().request("POST", "issues", json={"title": title, "body": body, "labels": labels})).json()
         return f"Created issue #{i['number']}: {i['html_url']}"
+    if replace_body:
+        if not body:
+            raise ToolError("replace_body needs the new body text; refusing to blank an issue.")
+        await gh().request("PATCH", f"issues/{number}", json={"body": body})
+        if close:
+            await gh().request("PATCH", f"issues/{number}", json={"state": "closed", "state_reason": close})
+        return f"Issue #{number}: body replaced{' and closed (' + close + ')' if close else ''}."
     if body:
         await gh().request("POST", f"issues/{number}/comments", json={"body": body})
     if close:
@@ -1487,6 +1678,84 @@ def _stop_jobs() -> None:
                 _terminate_job(job)
             except (ProcessLookupError, PermissionError):
                 pass
+
+
+# ----------------------------------------------------------------------------------------------- local model (LM Studio)
+# A cheap first pass on the owner's LM Studio server (SKYRUNNER_LOCAL_LLM). The large model on it must not be disturbed: these tools
+# only use a model that is ALREADY LOADED, never load, unload or download one, never use its MCP integrations, run one request at
+# a time across every agent, and everything they return is a draft for an agent to check: they decide, review, post and merge nothing.
+async def _local(coro):
+    try:
+        return await coro
+    except _llm.LocalLLMError as e:
+        raise ToolError(str(e)) from e
+
+
+@mcp.tool(name="local_llm_status", annotations=LOCAL_LLM)
+async def local_llm_status() -> str:
+    """Which model is loaded on the local LM Studio server, its context window and how many characters of a log or diff the other
+    local_llm_* tools will send. A read-only look at the model list; it loads nothing."""
+    data = await _local(_llm.LocalLLM().models())
+    loaded = _llm.loaded_models(data)
+    ctx = {m["key"]: [i.get("config", {}).get("context_length") for i in m.get("loaded_instances", [])] for m in data.get("models", [])
+           if m.get("type") == "llm" and m.get("loaded_instances")}
+    return (f"Loaded: {', '.join(loaded) or 'none (this server never loads a model; load one in LM Studio)'}\n"
+            f"Context windows: {json.dumps(ctx)}\nInput budget: {_llm.input_budget(data)} characters")
+
+
+@mcp.tool(name="local_llm_digest", annotations=LOCAL_LLM)
+async def local_llm_digest(
+    text: Annotated[str, Field(description="A log or any text to summarise; leave empty to digest a pull request's diff.")] = "",
+    pr: Annotated[int, Field(ge=0, description="A pull request number whose diff to digest (when text is empty).")] = 0,
+    max_lines: Annotated[int, Field(ge=3, le=15)] = 8,
+) -> str:
+    """A short digest of a long log or a PR diff by the local model, exact error text quoted. A first pass only: it does not decide
+    whether a failure matters, and a reader checks the real log when it does."""
+    if bool(text) == bool(pr):
+        raise ToolError("Give either text or pr.")
+    llm = _llm.LocalLLM()
+    budget = _llm.input_budget(await _local(llm.models()))
+    what = "log"
+    if pr:
+        files = await gh().paged(f"pulls/{pr}/files", limit=300)
+        text = "\n".join(f"### {f['filename']} ({f['status']})\n{f.get('patch') or '(no patch)'}" for f in files)
+        what = "pull request diff"
+    return await _local(llm.chat(_llm.DIGEST_PROMPT.format(what=what, lines=max_lines, text=_llm.clip(text, budget)),
+                                 system="You are terse and exact.", max_tokens=450))
+
+
+@mcp.tool(name="local_llm_thread_summaries", annotations=LOCAL_LLM)
+async def local_llm_thread_summaries(number: Annotated[int, Field(ge=1)]) -> str:
+    """For each unanswered top-level review comment on a PR: what is asked, what to check, and an empty reply. A neutral reading, never
+    a verdict (a drafted reply once told a valid blocking finding that no change was needed). Nothing is posted or replied to."""
+    open_ = await _waiting_comments(number)
+    if not open_:
+        return f"#{number}: no unanswered review threads."
+    llm = _llm.LocalLLM()
+    out = [f"#{number}: {len(open_)} unanswered review thread(s). Summaries only, NOT replies: the author decides and writes the answer."]
+    for c in open_[:_llm.MAX_CALLS]:
+        summary = await _local(llm.chat(_llm.THREAD_PROMPT.format(path=c.get("path"), line=c.get("line") or c.get("original_line"),
+                                                                  body=_llm.clip(c.get("body", ""), 3000)),
+                                        system="You summarise review comments neutrally and never decide for the author.", max_tokens=200))
+        out += ["", f"## comment {c['id']} {c.get('path')}:{c.get('line') or c.get('original_line')}", summary]
+    return "\n".join(out)
+
+
+@mcp.tool(name="local_llm_triage", annotations=LOCAL_LLM)
+async def local_llm_triage(limit: Annotated[int, Field(ge=1, le=30)] = 10) -> str:
+    """Open PRs, one line each: the review tier (computed from the changed file paths, no model), who wrote it (branch prefix) and a
+    one-line summary from the local model. The tier is reliable; the summaries are loose, so read them as hints."""
+    prs = await gh().paged("pulls", limit=limit)
+    llm = _llm.LocalLLM()
+    lines = []
+    for p in prs[:limit]:
+        files = await gh().paged(f"pulls/{p['number']}/files", limit=300)
+        paths = [f["filename"] for f in files]
+        ref = (p.get("head") or {}).get("ref", "")
+        who = "claude" if ref.startswith("claude/") else ("codex" if ref.startswith("codex/") else "?")
+        one = await _local(llm.chat(_llm.TRIAGE_PROMPT.format(title=p["title"], files=", ".join(paths[:12])), max_tokens=60))
+        lines.append(f"#{p['number']} tier {_llm.tier_of(paths)}, authored by {who}{' (draft)' if p.get('draft') else ''}: {one.splitlines()[0]}")
+    return "\n".join(lines) or "No open pull requests."
 
 
 def main() -> None:
