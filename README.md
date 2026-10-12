@@ -56,7 +56,14 @@ dispatch without authentication. GitHub tools operate on the **game checkout's o
   `github_pr_states` (the open PRs as JSON for a program: full head sha, branch, draft, CI with failing jobs, marked agent reviews, unanswered
   review thread ids, and recently merged numbers; the alert feed reads it instead of calling `gh`).
 
-All 30 existing tool names are preserved. The bundled `mcp_introspect.gd` adapter reads the target game's
+- Local model (LM Studio, optional): `local_llm_status`, `local_llm_digest` (a log or a PR diff), `local_llm_thread_summaries`
+  (what each unanswered review comment asks and what to check, never a verdict or a reply) and `local_llm_triage` (open PRs: the
+  review tier from the file paths, no model, plus a one-line summary). Set `SKYRUNNER_LOCAL_LLM` to the server address. The owner's
+  large model lives on that server, so these tools use only a model that is **already loaded** (they read `/api/v1/models`, read-only,
+  first), never call a load, unload or download endpoint and never use its MCP integrations, run one request at a time across every
+  agent's server process, pause after each call and keep reasoning off by default. Their output is a draft for an agent to check.
+
+All 30 original tool names are preserved. The bundled `mcp_introspect.gd` adapter reads the target game's
 compiled command/role/switch definitions, so no server implementation needs to live in the game repository.
 The test worker and collaboration guide ship inside the package, including wheels.
 
@@ -77,6 +84,8 @@ uv sync
 uv run python tests/test_guards.py src/skyrunner_mcp/server.py
 uv run python tests/test_runtime.py
 uv run python tests/test_collaboration.py
+uv run python tests/test_github_collab.py
+uv run python tests/test_local_llm.py
 uv build
 ```
 

@@ -19,5 +19,6 @@ jobs:
       - run: python tests/test_runtime.py
       - run: python tests/test_collaboration.py
       - run: python tests/test_github_collab.py
+      - run: python tests/test_local_llm.py
       - run: python tests/test_log_digest.py
       - run: python -m build

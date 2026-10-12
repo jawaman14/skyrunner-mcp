@@ -60,6 +60,19 @@ update. Current running clients do not expose this new tool until installed/reco
 Owner ruling in game board note 88: both agents lose points for insufficient collaboration tooling;
 score entries belong to the game score log, not this server repository. No merge performed.
 
+## Local-model tools (Claude, 11 October 2026)
+
+Branch `claude/local-llm-tools`, base main `1f7acd3`. Adds four tools for the owner's LM Studio server (`SKYRUNNER_LOCAL_LLM`):
+`local_llm_status`, `local_llm_digest`, `local_llm_thread_summaries`, `local_llm_triage`, in `local_llm.py` and a new section of `server.py`.
+The owner's large model is on that server and a model that does not fit freezes the machine, so: only an already-loaded model is ever
+used (the model list is read first, read-only), no load, unload or download call, no MCP integrations, one request at a time across
+processes (an OS file lock), a pause after each call, capped calls and input, reasoning off. Output is a draft; nothing is decided,
+posted or replied to. The game repository has the same logic as a CLI worker (`tools/local_llm/worker.py`, jawaman14/skyrunner #336),
+including `first-draft`, which writes branches and PRs and is deliberately NOT a server tool.
+Tests: `tests/test_local_llm.py`, 12 tests (a fake LM Studio and fake GitHub): an unloaded model is never requested, no load/unload
+path is ever called, the lock, the budget, the tools' errors; guards 2, runtime 18 (one POSIX skip), collaboration 15, GitHub 9 pass.
+Not verified: a real call through the server (a client must be restarted to see new tools). Next: independent review, CI on Windows and
+Linux, a server release, then a SEPARATE game PR moving the pin and the expected tool count in `tools/mcp/test_connection.py` (37 to 41).
 ## github_review_packet (Claude, 11 October 2026)
 
 Branch `claude/review-packet-tool`, base main `1f7acd3`. One read-only tool: a bounded review packet for a PR at its CURRENT head (full head sha,
