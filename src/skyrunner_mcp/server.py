@@ -383,6 +383,8 @@ async def _run_queued(job: Job, kind, command, summarize, env, timeout_s, extra)
         while not job.cancelled:
             try:
                 await _start_job(kind, command, summarize, env=env, timeout_s=timeout_s, extra=extra, job=job)
+                if job.cancelled:  # cancelled while the process was being created: stop it now it exists
+                    _terminate_job(job, force=True)
                 return
             except ToolError as e:
                 job.waiting_for = str(e)[:300]
@@ -566,7 +568,7 @@ async def skyrunner_run_tests(
     if shard:
         env["SHARD"] = shard
     job = await _start_job("tests", command, _summarize_tests, env=env, timeout_s=3600, queue=queue, notify=notify)
-    await _wait(job, wait_seconds)
+    await _wait(job, 0 if queue else wait_seconds)  # a queued call returns at once
     return _report(job, tail_lines=0 if not job.running else 10)
 
 
@@ -587,7 +589,7 @@ async def skyrunner_smoke(
     if map:
         cmd += ["--map", map]
     job = await _start_job("smoke", cmd, _summarize_marker("SMOKE OK"), timeout_s=1800, queue=queue, notify=notify)
-    await _wait(job, wait_seconds)
+    await _wait(job, 0 if queue else wait_seconds)  # a queued call returns at once
     return _report(job, tail_lines=15)
 
 
@@ -641,7 +643,7 @@ async def skyrunner_balance(
         if value is not None:
             cmd += [flag, str(value)]
     job = await _start_job("balance", cmd, _summarize_plain, timeout_s=7200, queue=queue, notify=notify)
-    await _wait(job, wait_seconds)
+    await _wait(job, 0 if queue else wait_seconds)  # a queued call returns at once
     return _report(job, tail_lines=30)
 
 
@@ -674,7 +676,7 @@ async def skyrunner_run_tool(
     if args:
         cmd += ["--", *_check_args(args)]
     job = await _start_job("tool", cmd, _summarize_plain, timeout_s=3600, queue=queue, notify=notify)
-    await _wait(job, wait_seconds)
+    await _wait(job, 0 if queue else wait_seconds)  # a queued call returns at once
     return _report(job, tail_lines=40)
 
 
@@ -702,7 +704,7 @@ async def skyrunner_import(wait_seconds: Annotated[int, Field(ge=0, le=900)] = 6
     surfaces parse errors in every script (warnings are errors in this project). Also fetches pinned Godot."""
     job = await _start_job("import", [godot(), "--headless", "--import"], _summarize_plain, timeout_s=1800,
                            queue=queue, notify=notify)
-    await _wait(job, wait_seconds)
+    await _wait(job, 0 if queue else wait_seconds)  # a queued call returns at once
     return _report(job, tail_lines=10)
 
 

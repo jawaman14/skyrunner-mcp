@@ -223,6 +223,29 @@ class Runtime(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("queue done" in n["text"] and job.id in n["text"] for n in notes), notes)
         self.assertFalse(first.queued)
 
+    async def test_a_queued_tool_call_returns_at_once_whatever_wait_seconds_says(self):
+        await server._start_job("first", self._sleep_cmd(2.0), server._summarize_plain, timeout_s=20)
+        began = asyncio.get_running_loop().time()
+        with patch.object(server, "godot", return_value=sys.executable):
+            text = await server.skyrunner_import(wait_seconds=30, queue=True)
+        self.assertLess(asyncio.get_running_loop().time() - began, 5.0, "it did not wait for the lock")
+        self.assertIn("queued, number 1", text)
+
+    async def test_cancelling_while_the_process_is_being_created_still_stops_it(self):
+        real = server.asyncio.create_subprocess_exec
+
+        async def slow_spawn(*args, **kwargs):
+            await asyncio.sleep(0.4)
+            return await real(*args, **kwargs)
+        with patch.object(server.asyncio, "create_subprocess_exec", slow_spawn):
+            job = await server._start_job("race", self._sleep_cmd(30), server._summarize_plain, timeout_s=60, queue=True)
+            await asyncio.sleep(0.15)  # the runner is inside the spawn
+            self.assertTrue(job.queued)
+            await server.skyrunner_job_cancel(job.id)
+            await asyncio.sleep(1.2)
+        self.assertIsNotNone(job.proc, "the spawn finished")
+        self.assertFalse(job.running, "and the process was stopped, not left running")
+
     async def test_without_queue_a_busy_lock_still_refuses(self):
         await server._start_job("first", self._sleep_cmd(1.0), server._summarize_plain, timeout_s=20)
         with self.assertRaises(server.ToolError):
