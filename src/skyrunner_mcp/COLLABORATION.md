@@ -78,6 +78,14 @@ started from a shell, use `skyrunner-godot-lock --wait -- bash tools/test.sh <fi
 server jobs instead of competing with them. After a forced server crash, inspect for surviving Godot descendants
 before starting another job; do not assume a released handle proves all descendants exited.
 
+**Queueing.** The refusal above is the default. Pass `queue=true` to `skyrunner_run_tests`, `skyrunner_smoke`,
+`skyrunner_balance`, `skyrunner_run_tool` or `skyrunner_import` to line the run up instead: the call returns a job id at
+once and carries on, the job shows as `queued, number N` in `skyrunner_job_status` (with who holds the lock), and it starts
+by itself when the lock is free. Queued jobs of one server start in the order they were queued; the lock is still taken
+the same way, so another agent's job or a `skyrunner-godot-lock --wait` shell run is waited for, not interrupted. Set
+`notify` (`claude`, `codex` or `all`) to get a board note, `queue done: <job id> passed|FAILED ...`, when it ends, and
+use `skyrunner_job_cancel` to drop a job that is still queued.
+
 ## Client setup
 
 Claude Code uses the repository's `.mcp.json`; check `/mcp` and accept the server's project trust prompt
