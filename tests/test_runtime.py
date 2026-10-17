@@ -34,8 +34,17 @@ class Runtime(unittest.IsolatedAsyncioTestCase):
         self.work = patch.object(server, "WORK", Path(self.temp.name))
         self.work.start()
         server.JOBS.clear()
+        server._queue_turn = None  # the queue's lock belongs to one event loop: each test has its own
+        self.poll = patch.object(server, "QUEUE_POLL_S", 0.05)
+        self.poll.start()
 
     async def asyncTearDown(self):
+        self.poll.stop()
+        for job in list(server.JOBS.values()):
+            if job.queued:
+                job.cancelled = True
+                job.done.set()
+        await asyncio.sleep(0.2)  # let the queue's runners see the cancel
         for job in server.JOBS.values():
             if job.running:
                 server._terminate_job(job, force=True)
@@ -133,6 +142,91 @@ class Runtime(unittest.IsolatedAsyncioTestCase):
             await server._start_job("second", [sys.executable, "-c", "pass"], server._summarize_plain)
         await server.skyrunner_job_cancel(job.id)
         self.assertFalse(job.running)
+
+    # ------------------------------------------------------------------ the queue
+    SLEEP = [sys.executable, "-c", "import time; time.sleep(%s)"]
+
+    def _sleep_cmd(self, seconds):
+        return [self.SLEEP[0], self.SLEEP[1], self.SLEEP[2] % seconds]
+
+    async def test_queued_job_waits_for_the_running_job_then_runs(self):
+        first = await server._start_job("first", self._sleep_cmd(1.0), server._summarize_plain, timeout_s=20)
+        second = await server._start_job("second", [sys.executable, "-c", "print('ran')"], server._summarize_plain,
+                                         timeout_s=20, queue=True)
+        self.assertTrue(second.queued)
+        self.assertIsNone(second.proc)
+        self.assertEqual(server._queue_position(second), 1)
+        self.assertIn("queued, number 1", server._report(second))
+        self.assertIn("queued, number 1", await server.skyrunner_job_status())
+        await server._wait(second, 20)
+        self.assertEqual(second.exit_code, 0)
+        self.assertIn("ran", second.text())
+        self.assertLessEqual(first.ended, second.started, "the queued job started only after the first one ended")
+
+    async def test_queued_jobs_run_in_the_order_they_were_queued(self):
+        await server._start_job("first", self._sleep_cmd(0.8), server._summarize_plain, timeout_s=20)
+        a = await server._start_job("a", self._sleep_cmd(0.1), server._summarize_plain, timeout_s=20, queue=True)
+        b = await server._start_job("b", self._sleep_cmd(0.1), server._summarize_plain, timeout_s=20, queue=True)
+        c = await server._start_job("c", self._sleep_cmd(0.1), server._summarize_plain, timeout_s=20, queue=True)
+        self.assertEqual([server._queue_position(j) for j in (a, b, c)], [1, 2, 3])
+        for j in (a, b, c):
+            await server._wait(j, 20)
+        self.assertTrue(a.started <= b.started <= c.started, "first in, first out")
+        self.assertTrue(all(j.exit_code == 0 for j in (a, b, c)))
+
+    async def test_a_free_lock_starts_a_queued_job_at_once(self):
+        job = await server._start_job("now", [sys.executable, "-c", "pass"], server._summarize_plain, timeout_s=20, queue=True)
+        await server._wait(job, 20)
+        self.assertEqual(job.exit_code, 0)
+
+    async def test_cancelling_a_queued_job_means_it_never_starts(self):
+        await server._start_job("first", self._sleep_cmd(1.0), server._summarize_plain, timeout_s=20)
+        second = await server._start_job("second", [sys.executable, "-c", "pass"], server._summarize_plain,
+                                         timeout_s=20, queue=True)
+        with patch.object(server.asyncio, "create_subprocess_exec", wraps=server.asyncio.create_subprocess_exec) as spawn:
+            self.assertIn("cancelled", await server.skyrunner_job_cancel(second.id))
+            await asyncio.sleep(0.3)
+        self.assertFalse(second.queued)
+        self.assertIsNone(second.proc)
+        self.assertIn("cancelled while queued", server._report(second))
+        spawn.assert_not_called()
+
+    async def test_a_queued_job_waits_for_the_machine_lock_held_elsewhere(self):
+        other = server.MachineLock(server.MACHINE_LOCK, {"kind": "tests", "root": "other-worktree", "pid": 1})
+        job = await server._start_job("waits", [sys.executable, "-c", "pass"], server._summarize_plain, timeout_s=20, queue=True)
+        await asyncio.sleep(0.4)
+        self.assertTrue(job.queued, "still waiting while the other agent's job holds the lock")
+        self.assertIn("other-worktree", job.waiting_for)
+        other.close()
+        await server._wait(job, 20)
+        self.assertEqual(job.exit_code, 0)
+
+    async def test_a_queued_job_that_cannot_start_ends_instead_of_waiting_forever(self):
+        with patch.object(server.shutil, "which", return_value=None):
+            job = await server._start_job("missing", [str(Path(self.temp.name) / "no-such-program")],
+                                          server._summarize_plain, timeout_s=20, queue=True)
+            await server._wait(job, 10)
+        self.assertFalse(job.queued)
+        self.assertIsNone(job.proc)
+        self.assertIn("could not start", server._report(job))
+
+    async def test_a_finished_queued_job_tells_the_board_recipient(self):
+        from skyrunner_mcp.collaboration import Board
+        board = Board(Path(self.temp.name) / "queue-board.sqlite3")
+        with patch.object(server, "_board", return_value=board):
+            first = await server._start_job("first", self._sleep_cmd(0.5), server._summarize_plain, timeout_s=20)
+            job = await server._start_job("done", [sys.executable, "-c", "pass"], server._summarize_plain,
+                                          timeout_s=20, queue=True, notify="claude")
+            await server._wait(job, 20)
+            await asyncio.sleep(0.2)
+            notes = board.read(recipient="claude")["notes"]
+        self.assertTrue(any("queue done" in n["text"] and job.id in n["text"] for n in notes), notes)
+        self.assertFalse(first.queued)
+
+    async def test_without_queue_a_busy_lock_still_refuses(self):
+        await server._start_job("first", self._sleep_cmd(1.0), server._summarize_plain, timeout_s=20)
+        with self.assertRaises(server.ToolError):
+            await server._start_job("second", [sys.executable, "-c", "pass"], server._summarize_plain)
 
     async def test_deadline(self):
         job = await server._start_job("fixture", [sys.executable, "-c", "import time; time.sleep(60)"],

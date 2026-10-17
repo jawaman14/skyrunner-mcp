@@ -72,7 +72,8 @@ mcp = MCPServer(
         "renew claims and leave durable notes for Claude/Codex. Use separate worktrees; never discard another agent's work. "
         "Read the game CLAUDE.md and the server-provided COLLABORATION.md guide. Typical loop: edit code -> skyrunner_run_tests(filter) for the "
         "touched system -> full skyrunner_run_tests before a PR -> push -> github_pr_create -> github_ci_status. "
-        "Long runs return a job id; poll skyrunner_job_status instead of starting the run again."
+        "Long runs return a job id; poll skyrunner_job_status instead of starting the run again. Pass queue=true to a "
+        "test, smoke, balance, tool or import run to line it up behind the running Godot job and carry on with other work."
     ),
 )
 
@@ -232,15 +233,28 @@ class Job:
     kind: str
     command: list[str]
     log: Path
-    proc: asyncio.subprocess.Process
+    proc: "asyncio.subprocess.Process | None"  # None while the job waits in the queue
     started: float
     summarize: object  # Callable[[str, int | None], dict]
     ended: float | None = None
     extra: dict = field(default_factory=dict)
+    queued_at: float | None = None  # set when the job was queued behind another Godot job
+    waiting_for: str = ""  # who holds the lock it is waiting for
+    cancelled: bool = False
+    notify: str = ""  # board recipient to tell when a queued job ends ("" = nobody)
+    done: asyncio.Event = field(default_factory=asyncio.Event)
 
     @property
     def running(self) -> bool:
-        return self.proc.returncode is None
+        return self.proc is not None and self.proc.returncode is None
+
+    @property
+    def queued(self) -> bool:
+        return self.proc is None and not self.done.is_set()
+
+    @property
+    def exit_code(self) -> int | None:
+        return None if self.proc is None else self.proc.returncode
 
     def text(self) -> str:
         try:
@@ -257,16 +271,40 @@ def _active_godot_job() -> Job | None:
     return next((j for j in JOBS.values() if j.running), None)
 
 
+def _state_word(j: Job) -> str:
+    if j.running:
+        return "running"
+    if j.queued:
+        return f"queued, number {_queue_position(j)}"
+    return "not run" if j.proc is None else f"exit {j.exit_code}"
+
+
+def _queue_position(job: Job) -> int:
+    """1 for the job that runs next; 0 when the job is not queued."""
+    waiting = sorted((j for j in JOBS.values() if j.queued), key=lambda j: j.queued_at or 0.0)
+    return waiting.index(job) + 1 if job in waiting else 0
+
+
+_queue_turn: asyncio.Lock | None = None  # queued jobs of this server start in the order they were queued (asyncio.Lock is FIFO)
+QUEUE_POLL_S = 3.0
+
+
 async def _start_job(kind: str, command: list[str], summarize, env: dict | None = None, timeout_s: int = 3600,
-                     extra: dict | None = None) -> Job:
+                     extra: dict | None = None, queue: bool = False, notify: str = "", job: Job | None = None) -> Job:
+    """Start a Godot job now, or refuse. With `queue`, return at once with a queued job that starts when the Godot
+    lock is free (this server's own jobs first, in order) and, if `notify` names a board recipient, tells them when
+    it ends. `job` is the queued job being started by its runner."""
     global _job_counter
+    if queue and job is None:
+        return _enqueue_job(kind, command, summarize, env, timeout_s, extra, notify)
     busy = _active_godot_job()
     if busy:
         raise ToolError(f"Job {busy.id} ({busy.kind}) is still running; Godot jobs share the .godot/ import cache, "
                         f"so one runs at a time. Check it with skyrunner_job_status or stop it with skyrunner_job_cancel.")
     WORK.mkdir(parents=True, exist_ok=True)
-    _job_counter += 1
-    job_id = f"{kind}-{os.getpid()}-{_job_counter}-{uuid.uuid4().hex[:8]}"
+    if job is None:
+        _job_counter += 1
+    job_id = job.id if job else f"{kind}-{os.getpid()}-{_job_counter}-{uuid.uuid4().hex[:8]}"
     log = WORK / f"{job_id}.log"
     full_env = {**os.environ, **(env or {})}
     try:
@@ -299,7 +337,10 @@ async def _start_job(kind: str, command: list[str], summarize, env: dict | None 
         raise
     finally:
         handle.close()
-    job = Job(job_id, kind, command, log, proc, time.time(), summarize, extra=extra or {})
+    if job is None:
+        job = Job(job_id, kind, command, log, proc, time.time(), summarize, extra=extra or {})
+    else:  # the queued job starts now
+        job.log, job.proc, job.started, job.waiting_for = log, proc, time.time(), ""
     JOBS[job_id] = job
 
     async def _reap() -> None:
@@ -308,6 +349,8 @@ async def _start_job(kind: str, command: list[str], summarize, env: dict | None 
             job.ended = time.time()
         finally:
             release()
+            job.done.set()
+            _notify_done(job)
     asyncio.create_task(_reap())
     if wrapped is command:
         async def _deadline() -> None:
@@ -320,9 +363,54 @@ async def _start_job(kind: str, command: list[str], summarize, env: dict | None 
     return job
 
 
+def _enqueue_job(kind, command, summarize, env, timeout_s, extra, notify) -> Job:
+    global _job_counter
+    WORK.mkdir(parents=True, exist_ok=True)
+    _job_counter += 1
+    job_id = f"{kind}-{os.getpid()}-{_job_counter}-{uuid.uuid4().hex[:8]}"
+    job = Job(job_id, kind, command, WORK / f"{job_id}.log", None, time.time(), summarize, extra=extra or {},
+              queued_at=time.time(), notify=notify)
+    JOBS[job_id] = job
+    asyncio.create_task(_run_queued(job, kind, command, summarize, env, timeout_s, extra))
+    return job
+
+
+async def _run_queued(job: Job, kind, command, summarize, env, timeout_s, extra) -> None:
+    global _queue_turn
+    if _queue_turn is None:
+        _queue_turn = asyncio.Lock()
+    async with _queue_turn:  # the job at the head of the queue polls; the others wait their turn behind it
+        while not job.cancelled:
+            try:
+                await _start_job(kind, command, summarize, env=env, timeout_s=timeout_s, extra=extra, job=job)
+                return
+            except ToolError as e:
+                job.waiting_for = str(e)[:300]
+            except BaseException as e:  # a spawn failure ends the job instead of waiting forever
+                job.extra["start_error"] = repr(e)
+                break
+            await asyncio.sleep(QUEUE_POLL_S)
+    job.ended = time.time()
+    job.done.set()
+    _notify_done(job)
+
+
+def _notify_done(job: Job) -> None:
+    """Tell the board recipient a queued job has ended (the board channel wakes an agent that reads it)."""
+    if not job.notify or job.queued_at is None:
+        return
+    try:
+        s = job.summarize(job.text(), 124 if job.extra.get("timed_out") else job.exit_code)
+        state = "cancelled" if job.cancelled and job.proc is None else ("passed" if s.get("ok") else "FAILED")
+        facts = "; ".join(f"{k} {v}" for k, v in s.items() if k not in ("ok", "details"))[:200]
+        _board().note("mcp-queue", job.notify, f"queue done: {job.id} {state}. {facts} | skyrunner_job_status(job_id='{job.id}')")
+    except Exception:  # a missing board never stops the queue
+        pass
+
+
 async def _wait(job: Job, wait_seconds: float) -> None:
     try:
-        await asyncio.wait_for(asyncio.shield(job.proc.wait()), timeout=max(0.0, wait_seconds))
+        await asyncio.wait_for(asyncio.shield(job.done.wait()), timeout=max(0.0, wait_seconds))
     except asyncio.TimeoutError:
         pass
     await asyncio.sleep(0)  # let the reaper record the end time
@@ -330,8 +418,19 @@ async def _wait(job: Job, wait_seconds: float) -> None:
 
 def _report(job: Job, tail_lines: int = 40) -> str:
     text = job.text()
+    if job.queued:
+        waited = time.time() - (job.queued_at or time.time())
+        lines = [f"## Job {job.id} — queued, number {_queue_position(job)} ({waited:.0f} s)", f"`{' '.join(job.command)}`", ""]
+        if job.waiting_for:
+            lines.append(f"Waiting for: {job.waiting_for}")
+        lines.append(f"It starts by itself when the Godot lock is free. skyrunner_job_status(job_id='{job.id}') shows it; "
+                     f"skyrunner_job_cancel stops it.")
+        return "\n".join(lines)
+    if job.proc is None:  # cancelled in the queue, or it could not start
+        reason = "cancelled while queued" if job.cancelled else "could not start: " + job.extra.get("start_error", "unknown")
+        return f"## Job {job.id} — FAILED\n`{' '.join(job.command)}`\n\n{reason}"
     elapsed = (job.ended or time.time()) - job.started
-    s = job.summarize(text, 124 if job.extra.get("timed_out") else job.proc.returncode)
+    s = job.summarize(text, 124 if job.extra.get("timed_out") else job.exit_code)
     state = "running" if job.running else ("passed" if s.get("ok") else "FAILED")
     lines = [f"## Job {job.id} — {state} ({elapsed:.0f} s)", f"`{' '.join(job.command)}`", ""]
     for k, v in s.items():
@@ -443,6 +542,10 @@ async def skyrunner_run_tests(
                                                 "renaming scripts (class cache); skip for speed otherwise.")] = True,
     wait_seconds: Annotated[int, Field(description="How long to wait for the result before returning a job id.",
                                        ge=0, le=600)] = 120,
+    queue: Annotated[bool, Field(description="Don't refuse when Godot is busy: queue the job and return at once; it "
+                                             "starts when the lock is free. Poll skyrunner_job_status, or set notify.")] = False,
+    notify: Annotated[Literal["", "claude", "codex", "all"],
+                      Field(description="With queue: board recipient to tell when the job ends.")] = "",
 ) -> str:
     """Run the headless GDScript test suite (tests/run_tests.gd), optionally filtered, and summarise it.
 
@@ -462,7 +565,7 @@ async def skyrunner_run_tests(
         env["TEST_LANE"] = lane
     if shard:
         env["SHARD"] = shard
-    job = await _start_job("tests", command, _summarize_tests, env=env, timeout_s=3600)
+    job = await _start_job("tests", command, _summarize_tests, env=env, timeout_s=3600, queue=queue, notify=notify)
     await _wait(job, wait_seconds)
     return _report(job, tail_lines=0 if not job.running else 10)
 
@@ -473,13 +576,17 @@ async def skyrunner_smoke(
     map: Annotated[str, Field(description="Optional --map value: 'city' (Costa Brava) or a positive seed.",
                               pattern=r"^(city|\d+)?$")] = "",
     wait_seconds: Annotated[int, Field(ge=0, le=600)] = 180,
+    queue: Annotated[bool, Field(description="Don't refuse when Godot is busy: queue the job and return at once; it "
+                                             "starts when the lock is free. Poll skyrunner_job_status, or set notify.")] = False,
+    notify: Annotated[Literal["", "claude", "codex", "all"],
+                      Field(description="With queue: board recipient to tell when the job ends.")] = "",
 ) -> str:
     """CI's headless smoke run: the AI plays a new open-mode game for N frames; passes on 'SMOKE OK' with no
     script errors. Catches runtime errors that unit tests miss (scene wiring, autoloads, the main loop)."""
     cmd = [godot(), "--headless", "--path", str(ROOT), "--", "--unlocks", "open", "--watch", "--new", "--smoke", str(frames)]
     if map:
         cmd += ["--map", map]
-    job = await _start_job("smoke", cmd, _summarize_marker("SMOKE OK"), timeout_s=1800)
+    job = await _start_job("smoke", cmd, _summarize_marker("SMOKE OK"), timeout_s=1800, queue=queue, notify=notify)
     await _wait(job, wait_seconds)
     return _report(job, tail_lines=15)
 
@@ -523,13 +630,17 @@ async def skyrunner_balance(
     workers: Annotated[int | None, Field(ge=1, le=64)] = None,
     n: Annotated[int | None, Field(ge=1, le=100000)] = None,
     wait_seconds: Annotated[int, Field(ge=0, le=600)] = 60,
+    queue: Annotated[bool, Field(description="Don't refuse when Godot is busy: queue the job and return at once; it "
+                                             "starts when the lock is free. Poll skyrunner_job_status, or set notify.")] = False,
+    notify: Annotated[Literal["", "claude", "codex", "all"],
+                      Field(description="With queue: board recipient to tell when the job ends.")] = "",
 ) -> str:
     """Run the balance simulators (scripts/balance/cli.gd). Balance changes need a 'report' run (CLAUDE.md)."""
     cmd = [godot(), "--headless", "--script", "res://scripts/balance/cli.gd", "--", mode]
     for flag, value in (("--seeds", seeds), ("--workers", workers), ("--n", n)):
         if value is not None:
             cmd += [flag, str(value)]
-    job = await _start_job("balance", cmd, _summarize_plain, timeout_s=7200)
+    job = await _start_job("balance", cmd, _summarize_plain, timeout_s=7200, queue=queue, notify=notify)
     await _wait(job, wait_seconds)
     return _report(job, tail_lines=30)
 
@@ -544,6 +655,10 @@ async def skyrunner_run_tool(
                                              "'bake_terrain.gd', 'logistics_routes.gd'. Omit to list them.")] = "",
     args: Annotated[list[str], Field(description="User arguments placed after `--`.", max_length=16)] = [],
     wait_seconds: Annotated[int, Field(ge=0, le=600)] = 120,
+    queue: Annotated[bool, Field(description="Don't refuse when Godot is busy: queue the job and return at once; it "
+                                             "starts when the lock is free. Poll skyrunner_job_status, or set notify.")] = False,
+    notify: Annotated[Literal["", "claude", "codex", "all"],
+                      Field(description="With queue: board recipient to tell when the job ends.")] = "",
 ) -> str:
     """Run one of the project's headless tool scripts (`godot --headless --script res://tools/<script>`).
 
@@ -558,7 +673,7 @@ async def skyrunner_run_tool(
     cmd = [godot(), "--headless", "--script", f"res://tools/{script}"]
     if args:
         cmd += ["--", *_check_args(args)]
-    job = await _start_job("tool", cmd, _summarize_plain, timeout_s=3600)
+    job = await _start_job("tool", cmd, _summarize_plain, timeout_s=3600, queue=queue, notify=notify)
     await _wait(job, wait_seconds)
     return _report(job, tail_lines=40)
 
@@ -577,10 +692,16 @@ async def skyrunner_project_status(
 
 
 @mcp.tool(name="skyrunner_import", annotations=LOCAL_RUN)
-async def skyrunner_import(wait_seconds: Annotated[int, Field(ge=0, le=900)] = 600) -> str:
+async def skyrunner_import(wait_seconds: Annotated[int, Field(ge=0, le=900)] = 600,
+    queue: Annotated[bool, Field(description="Don't refuse when Godot is busy: queue the job and return at once; it "
+                                             "starts when the lock is free. Poll skyrunner_job_status, or set notify.")] = False,
+    notify: Annotated[Literal["", "claude", "codex", "all"],
+                      Field(description="With queue: board recipient to tell when the job ends.")] = "",
+) -> str:
     """Run `godot --headless --import`: refreshes the class cache after adding/renaming scripts or assets and
     surfaces parse errors in every script (warnings are errors in this project). Also fetches pinned Godot."""
-    job = await _start_job("import", [godot(), "--headless", "--import"], _summarize_plain, timeout_s=1800)
+    job = await _start_job("import", [godot(), "--headless", "--import"], _summarize_plain, timeout_s=1800,
+                           queue=queue, notify=notify)
     await _wait(job, wait_seconds)
     return _report(job, tail_lines=10)
 
@@ -676,7 +797,7 @@ async def skyrunner_job_status(
     if not job_id:
         if not JOBS:
             return "No jobs in this server session."
-        return "\n".join(f"- {j.id}: {'running' if j.running else 'exit ' + str(j.proc.returncode)}, "
+        return "\n".join(f"- {j.id}: {_state_word(j)}, "
                          f"{((j.ended or time.time()) - j.started):.0f} s, {' '.join(j.command)[:120]}" for j in JOBS.values())
     job = JOBS.get(job_id)
     if job is None:
@@ -691,8 +812,13 @@ async def skyrunner_job_cancel(job_id: str) -> str:
     job = JOBS.get(job_id)
     if job is None:
         raise ToolError(f"No job {job_id!r}.")
+    if job.queued:
+        job.cancelled = True
+        job.done.set()
+        job.ended = time.time()
+        return f"Job {job_id} was queued and is cancelled; it never started."
     if not job.running:
-        return f"Job {job_id} already finished (exit {job.proc.returncode})."
+        return f"Job {job_id} already finished (exit {job.exit_code})."
     try:
         _terminate_job(job)
     except ProcessLookupError:
