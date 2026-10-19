@@ -39,6 +39,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field
 from .collaboration import Board, MachineLock, ProjectLock, board_path, machine_lock_path
+from . import clock as clock_mod
 from . import local_llm as _llm
 
 logging.getLogger("httpx").setLevel(logging.WARNING)  # one INFO line per request otherwise
@@ -168,6 +169,67 @@ async def skyrunner_collaboration_note(author: str, text: str,
     except ValueError as e:
         raise ToolError(str(e)) from e
     return json.dumps({"note_id": note})
+
+
+def _clock() -> clock_mod.Clock:
+    return clock_mod.Clock(_board().path)
+
+
+@mcp.tool(name="clock_now", annotations=READ_ONLY)
+async def clock_now(timezone: str = "local") -> str:
+    """The current date and time (local zone by default; or UTC, or an IANA name such as Australia/Sydney). Use it instead of guessing how long "until 4:11 PM" is."""
+    try:
+        return json.dumps(clock_mod.now(timezone))
+    except ValueError as e:
+        raise ToolError(str(e)) from e
+
+
+@mcp.tool(name="clock_timer_set", annotations=LOCAL_RUN)
+async def clock_timer_set(owner: Literal["claude", "codex", "owner"], label: str, at: str = "", in_minutes: int = 0,
+                          agent: Literal["claude", "codex", "owner", ""] = "", timezone: str = "local") -> str:
+    """Remember a time to come back at: `at` is HH:MM (the next time the clock reads it), h:MM am/pm or an ISO date-time; or `in_minutes` from now.
+
+    Set `agent` when someone is away until then ("codex is out of usage until 16:11"): the timer is then an availability note. Nothing wakes anyone: ask `clock_timers`.
+    """
+    try:
+        due = clock_mod.parse_when(at, in_minutes, timezone)
+        timer = _clock().set(owner, label, due, agent)
+    except ValueError as e:
+        raise ToolError(str(e)) from e
+    return json.dumps({"timer_id": timer, "due": clock_mod.now(timezone, due), "in_seconds": int(due - time.time())})
+
+
+@mcp.tool(name="clock_timers", annotations=READ_ONLY)
+async def clock_timers(include_cleared: bool = False, timezone: str = "local") -> str:
+    """The time now and every timer: pending (seconds left) or due. Check it when you wake or before you report that you are waiting."""
+    try:
+        return json.dumps({"now": clock_mod.now(timezone), "timers": _clock().rows(include_cleared, tz_name=timezone)})
+    except ValueError as e:
+        raise ToolError(str(e)) from e
+
+
+@mcp.tool(name="clock_timer_clear", annotations=LOCAL_RUN)
+async def clock_timer_clear(timer_id: int) -> str:
+    """Clear a timer that is done or no longer needed (the timer stays in the history)."""
+    try:
+        _clock().clear(timer_id)
+    except ValueError as e:
+        raise ToolError(str(e)) from e
+    return json.dumps({"cleared": timer_id})
+
+
+@mcp.tool(name="clock_wait", annotations=READ_ONLY)
+async def clock_wait(timer_id: int, max_seconds: int = clock_mod.MAX_WAIT_S) -> str:
+    """Wait for a timer to come due, for at most max_seconds (up to 540); returns at once if it is already due. Says how long is left if it is still pending."""
+    try:
+        left = _clock().remaining(timer_id)
+    except ValueError as e:
+        raise ToolError(str(e)) from e
+    wait = min(left, max(0, min(int(max_seconds), clock_mod.MAX_WAIT_S)))
+    if wait > 0:
+        await asyncio.sleep(wait)
+    left = _clock().remaining(timer_id)
+    return json.dumps({"timer_id": timer_id, "due": left <= 0, "seconds_left": int(left)})
 
 
 @mcp.tool(name="skyrunner_collaboration_start", annotations=READ_ONLY)
@@ -1122,24 +1184,35 @@ async def github_pr_view(number: Annotated[int, Field(ge=1)], repo: REPO_ARG = N
 
 
 @mcp.tool(name="github_pr_create", annotations=GH_WRITE)
+@_scoped
 async def github_pr_create(
     title: Annotated[str, Field(min_length=3, max_length=200)],
     body: Annotated[str, Field(description="Markdown description: what changed, why, how it was verified.")],
     draft: Annotated[bool, Field()] = True,
     base: Annotated[str, Field()] = "main",
     head: Annotated[str, Field(description="Branch to merge; empty = current branch (must already be pushed).")] = "",
+    repo: REPO_ARG = None,
 ) -> str:
     """Open a pull request (draft by default, per CLAUDE.md: feature branch -> PR into main). Refuses if the branch
-    isn't pushed or the remote tip differs from the local one, so CI runs on what you tested."""
+    isn't pushed or the remote tip differs from the local one, so CI runs on what you tested. With `repo` (the server's own repository) the branch
+    is checked on GitHub instead, because the game checkout's origin is a different repository; `head` is then required."""
+    if repo and not head:
+        raise ToolError("Name the head branch when opening a pull request in another repository.")
     head = head or _git("rev-parse", "--abbrev-ref", "HEAD")
     if head in (base, "HEAD"):
         raise ToolError(f"Head branch {head!r} can't be the base; create a feature branch first.")
-    local = _git("rev-parse", head, check=False)
-    remote = _git("ls-remote", "origin", f"refs/heads/{head}", check=False).split("\t")[0]
-    if not remote:
-        raise ToolError(f"Branch {head!r} isn't on origin. Push it first: git push -u origin {head}")
-    if local and remote != local:
-        raise ToolError(f"origin/{head} is at {remote[:8]} but local {head} is at {local[:8]}; push (or pull) first.")
+    if repo:
+        try:
+            await gh().get(f"branches/{head}")
+        except Exception as e:
+            raise ToolError(f"Branch {head!r} isn't on {repo}: push it first ({e}).") from e
+    else:
+        local = _git("rev-parse", head, check=False)
+        remote = _git("ls-remote", "origin", f"refs/heads/{head}", check=False).split("	")[0]
+        if not remote:
+            raise ToolError(f"Branch {head!r} isn't on origin. Push it first: git push -u origin {head}")
+        if local and remote != local:
+            raise ToolError(f"origin/{head} is at {remote[:8]} but local {head} is at {local[:8]}; push (or pull) first.")
     existing = await gh().get("pulls", state="open", head=f"{gh().owner}:{head}")
     if existing:
         return f"An open PR already exists for {head}: #{existing[0]['number']} {existing[0]['html_url']}"
